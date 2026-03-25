@@ -43,6 +43,7 @@ hint_linked_worktree_if_needed() {
   echo "  After \`park\`, your WIP is usually already in this directory — use git status." >&2
   echo "  Stashes are often empty here (stash was popped when the worktree was created)." >&2
   echo "  Run \`park\` again only from the primary clone (checkout on main/master)." >&2
+  echo "  Back to primary clone: cd \"\$(git park home)\"" >&2
   echo "" >&2
 }
 
@@ -235,7 +236,8 @@ park_run() {
   echo "Done. Continue WIP in:"
   echo "  cd $(printf '%q' "$worktree_path")"
   echo "Reminder: git-park status  (from any worktree of this repo)" >&2
-  echo "Jump here in one shot: cd \"\$(git park go)\"" >&2
+  echo "Jump to this WIP later: cd \"\$(git park go)\"" >&2
+  echo "From linked worktree back to here: cd \"\$(git park home)\"" >&2
 }
 
 cmd_help() {
@@ -250,6 +252,7 @@ Usage:
   git-park park [OPTIONS] [WORKTREE_PATH]
   git-park restore          pick stash or saved worktree (interactive)
   git-park go [--pick] [PATH]   print path only — use: cd "$(git park go)"
+  git-park home                 print primary clone path — use: cd "$(git park home)"
   git-park status
   git-park help
 
@@ -269,6 +272,10 @@ go:
   - Prints **only** a directory path on stdout (for `cd "$(git park go)"`). Not a subprocess cd;
     your shell runs cd after reading the path.
   - Default: WORKTREE_PATH from wip-worktree-last. `--pick`: interactive list. Optional PATH argument.
+
+home:
+  - Prints **only** the **primary** (original) worktree path — the first entry Git reports (main clone).
+  - Use `cd "$(git park home)"` from a linked worktree to jump back without remembering ~/Projects/.../embodik.
 
 Options (park):
   -i, --integration BRANCH   Branch to leave this clone on (default: main or master)
@@ -347,6 +354,15 @@ worktree_paths_porcelain() {
   git -C "$root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}'
 }
 
+# Git lists the primary (original) checkout first in porcelain — same as main clone path.
+primary_worktree_path() {
+  local root p
+  root="$(repo_root)" || return 1
+  p="$(git -C "$root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10); exit}')"
+  [[ -n "${p:-}" ]] || return 1
+  printf '%s\n' "$p"
+}
+
 tac_fallback_reverse() {
   local f="$1"
   mapfile -t _hist_lines <"$f"
@@ -391,7 +407,9 @@ wt_append_unique() {
 # Display labels: "[last park] …", "[history …] …", or bare porcelain path.
 extract_path_from_pick() {
   local s="$1"
-  if [[ "$s" == "[last park] "* ]]; then
+  if [[ "$s" == "[primary] "* ]]; then
+    printf '%s\n' "${s#"[primary] "}"
+  elif [[ "$s" == "[last park] "* ]]; then
     printf '%s\n' "${s#"[last park] "}"
   elif [[ "$s" == '[history '* ]]; then
     s="${s#*] }"
@@ -514,9 +532,13 @@ history_tsv_newest_first() {
 fill_worktree_pick_options() {
   local _opts_name="$1"
   local _seen_name="$2"
-  local hf line lp dt path br int had disp
+  local hf line lp dt path br int had disp pr
 
   hf="$(history_file)"
+
+  if pr="$(primary_worktree_path 2>/dev/null)"; then
+    wt_append_unique "$_opts_name" "$_seen_name" "[primary] $pr" "$pr"
+  fi
 
   if lp="$(last_park_worktree_path 2>/dev/null)"; then
     wt_append_unique "$_opts_name" "$_seen_name" "[last park] $lp" "$lp"
@@ -548,6 +570,7 @@ git-park go — print worktree path for your shell to cd into
 
   cd "$(git park go)"              # last path from wip-worktree-last
   cd "$(git park go --pick)"       # choose from same list as Restore → Show cd
+  cd "$(git park home)"            # primary (original) clone — use from a linked worktree
 
 Optional explicit directory (must exist):
   cd "$(git park go /path/to/worktree)"
@@ -563,7 +586,7 @@ EOF
   done
   [[ $# -eq 0 ]] || die "go: unexpected argument: $*"
 
-  local root path pick_line lastp
+  local root path pick_line
   root="$(repo_root)" || { echo "git-park go: not inside a git repository" >&2; return 1; }
 
   if [[ -n "$explicit" ]]; then
@@ -591,6 +614,35 @@ EOF
   return 0
 }
 
+# stdout: primary (main) worktree path only. stderr: errors. For: cd "$(git park home)"
+cmd_home() {
+  if [[ "${1:-}" == "-h" ]] || [[ "${1:-}" == "--help" ]]; then
+    cat <<'EOF' >&2
+git-park home — print the primary (original) worktree path
+
+  cd "$(git park home)"     # from a linked worktree, back to the main clone
+
+Git lists the primary checkout first in `git worktree list`; this prints that path.
+stdout is the directory only (same contract as `git park go`).
+EOF
+    return 0
+  fi
+  [[ $# -eq 0 ]] || die "home: unexpected argument: $1 (try: git-park home --help)"
+
+  local path
+  path="$(primary_worktree_path)" || {
+    echo "git-park home: not in a git repository or could not read worktrees" >&2
+    return 1
+  }
+  path="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$path")"
+  if command -v realpath >/dev/null 2>&1; then
+    path="$(realpath -m "$path" 2>/dev/null || printf '%s\n' "$path")"
+  fi
+  [[ -d "$path" ]] || { echo "git-park home: not a directory: $path" >&2; return 1; }
+  printf '%s\n' "$path"
+  return 0
+}
+
 cmd_restore_worktree_picker() {
   local root="$1"
   local -a options=()
@@ -603,7 +655,7 @@ cmd_restore_worktree_picker() {
     return 0
   }
 
-  local pick path lastp
+  local pick path lastp primary pkey lkey hkey
   pick="$(pick_from_strings "Pick path — copy the cd line below (↑↓ Enter)" "${options[@]}")" || return 0
   path="$(extract_path_from_pick "$pick")"
   [[ -n "$path" ]] || path="$pick"
@@ -613,6 +665,12 @@ cmd_restore_worktree_picker() {
   here="$(pwd -P)"
   cdline="cd $(printf '%q' "$path")"
   lastp="$(last_park_worktree_path 2>/dev/null || true)"
+  primary="$(primary_worktree_path 2>/dev/null || true)"
+  pkey="$(canonical_worktree_key "$path")"
+  lkey=""
+  hkey=""
+  [[ -n "${lastp:-}" ]] && lkey="$(canonical_worktree_key "$lastp")"
+  [[ -n "${primary:-}" ]] && hkey="$(canonical_worktree_key "$primary")"
 
   echo "" >&2
   if [[ "$here" == "$path" ]]; then
@@ -625,8 +683,10 @@ cmd_restore_worktree_picker() {
   echo
   echo "  $cdline"
   echo
-  if [[ -n "${lastp:-}" ]] && [[ "$(canonical_worktree_key "$path")" == "$(canonical_worktree_key "$lastp")" ]]; then
+  if [[ -n "$lkey" ]] && [[ "$pkey" == "$lkey" ]]; then
     echo "One-liner next time: cd \"\$(git park go)\"" >&2
+  elif [[ -n "$hkey" ]] && [[ "$pkey" == "$hkey" ]]; then
+    echo "One-liner next time: cd \"\$(git park home)\"" >&2
   else
     echo "One-liner (after this pick): cd \"\$(git park go --pick)\"" >&2
   fi
@@ -732,6 +792,7 @@ main() {
   case "$cmd" in
     park) cmd_park "$@" ;;
     go) cmd_go "$@" ;;
+    home) cmd_home "$@" ;;
     restore) cmd_interactive_restore || true ;;
     status) cmd_status ;;
     help|-h|--help) cmd_help ;;

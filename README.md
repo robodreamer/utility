@@ -45,7 +45,7 @@ git park
 Main menu:
 
 - **Park WIP** — prompts for worktree path and stash message, shows a **dry-run** summary, then asks for confirmation before changing anything.
-- **Restore** — (1) **Apply or pop a stash** into the **current worktree’s checkout**. After a successful `park`, the stash is usually **already applied** in the linked worktree, so the list is often empty — that is normal; use **git status** there. (2) **Show cd command** lists the primary clone, last park path, and history-derived paths **deduplicated** (same path won’t appear three times). Paste the `cd …` line (clipboard copy is attempted when `wl-copy` / `xclip` / `xsel` / `pbcopy` exists). If you pick the directory you’re already in, the tool says so and skips redundant `cd`.
+- **Restore** — (1) **Apply or pop a stash** into the **current worktree’s checkout**. After a successful `park`, the stash is usually **already applied** in the linked worktree, so the list is often empty — that is normal; use **git status** there. (2) **Show cd command** lists **`[primary]`** (main clone), **`[last park]`**, other worktrees, and history — **deduplicated** by path. Paste the `cd …` line (clipboard copy is attempted when `wl-copy` / `xclip` / `xsel` / `pbcopy` exists). If you pick the directory you’re already in, the tool says so and skips redundant `cd`.
 - **Status** — worktrees, stashes, last park file, and recent **history** (last parks).
 - **Help** / **Quit**
 
@@ -53,24 +53,33 @@ If your cwd is a **linked worktree**, you’ll see a short banner explaining tha
 
 **`git stash -u`:** the `park` step runs `git stash push -u`, which saves **staged + unstaged + untracked** files, then restores a clean tree so you can check out `main`. Ignored files (per `.gitignore`) stay ignored unless you also use `--all` (git-park does not). See `git help stash`.
 
-### Jump to the parked worktree without copy/paste
+### Jump between primary clone and parked worktree (no copy/paste)
 
 A script **cannot** `cd` your interactive shell. It *can* print a path so **your shell** runs `cd`:
+
+**→ Linked worktree (last park):** uses **`wip-worktree-last`**. From **any cwd inside the repo**:
 
 ```bash
 cd "$(git park go)"
 ```
 
-That uses **`wip-worktree-last`** (same target as the last successful park). Run it from **inside the repository** (any subdirectory). Interactive picker (same list as Restore → Show cd):
+**→ Primary (original) clone:** Git’s first worktree is always the main checkout — no need to remember `~/Projects/repos/embodik` vs typos like `embodiK`:
+
+```bash
+cd "$(git park home)"
+```
+
+Interactive picker (includes **`[primary]`** first, then **`[last park]`**, then other paths):
 
 ```bash
 cd "$(git park go --pick)"
 ```
 
-Optional shell shortcut:
+Optional shell shortcuts:
 
 ```bash
 alias parkcd='cd "$(git park go)"'
+alias parkhome='cd "$(git park home)"'
 ```
 
 Same one-shot menu: `git park menu`, `git park i`, or `git park interactive`.
@@ -84,6 +93,7 @@ Same one-shot menu: `git park menu`, `git park i`, or `git park interactive`.
 | `git park go` | Print **only** the last parked worktree path (stdout) — for `cd "$(git park go)"`. |
 | `git park go --pick` | Print path after interactive pick (same options as Restore → Show cd). |
 | `git park go /path/to/wt` | Print that path if it’s an existing directory (sanity check). |
+| `git park home` | Print **only** the **primary** worktree path — for `cd "$(git park home)"` (back from linked). |
 | `git park status` | List worktrees, stashes, last park, recent history. |
 | `git park help` | Full CLI text. |
 
@@ -95,7 +105,8 @@ Same one-shot menu: `git park menu`, `git park i`, or `git park interactive`.
 cd /path/to/my-repo          # primary clone
 git switch my-feature        # not main
 git park park                # default worktree under ~/git-worktrees/...
-cd "$(git park go)"          # jump to that worktree in one line (from any cwd inside the repo)
+cd "$(git park go)"          # into linked WIP
+cd "$(git park home)"        # back to primary clone (from worktree or primary)
 ```
 
 Custom worktree path:
