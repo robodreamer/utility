@@ -252,7 +252,7 @@ Usage:
   git-park help
 
 park:
-  - Stashes all changes (including untracked) on the current branch.
+  - Stashes with \`git stash push -u\` (saved: staged + unstaged + untracked; see \`git help stash\`).
   - Checks out the integration branch (main/master) in this clone.
   - Adds a linked worktree at WORKTREE_PATH for the branch you were on.
   - Pops the stash inside that worktree.
@@ -261,7 +261,7 @@ park:
 restore:
   - Stash: apply/pop affects the worktree that contains your cwd (repo root).
     After `park`, stashes are often already applied in the linked worktree — list may be empty.
-  - Show cd: prints a copy-pastable `cd` (last park, worktrees, history). Subprocesses cannot cd your shell.
+  - Show cd: copy-pastable `cd`; list is last park, then worktrees, then history (deduped by path).
 
 Options (park):
   -i, --integration BRANCH   Branch to leave this clone on (default: main or master)
@@ -340,20 +340,6 @@ worktree_paths_porcelain() {
   git -C "$root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}'
 }
 
-history_menu_lines() {
-  local hf="$1"
-  [[ -f "$hf" ]] || return 0
-  local line
-  if command -v tac >/dev/null 2>&1; then
-    while IFS= read -r line; do
-      _history_format_line "$line"
-    done < <(tac "$hf")
-  else
-    # shellcheck disable=SC2016
-    tac_fallback_reverse "$hf" | while IFS= read -r line; do _history_format_line "$line"; done
-  fi
-}
-
 tac_fallback_reverse() {
   local f="$1"
   mapfile -t _hist_lines <"$f"
@@ -370,10 +356,37 @@ _history_format_line() {
   printf '[history %s] %s  (branch %s → %s)\n' "$dt" "$path" "$br" "$int"
 }
 
-# History display: "[history DATE] /path  (branch …)"; porcelain / last-park lines are a bare path.
+# Normalize paths so /a/foo and /a/foo/ dedupe as the same option.
+canonical_worktree_key() {
+  local p="$1"
+  [[ -z "$p" ]] && return 0
+  if command -v realpath >/dev/null 2>&1; then
+    realpath -m "$p" 2>/dev/null && return 0
+  fi
+  printf '%s\n' "${p%/}"
+}
+
+# Append display to opts if canonical path not in seen (namerefs: opts array, seen assoc).
+wt_append_unique() {
+  local -n _wu_opts="$1"
+  local -n _wu_seen="$2"
+  local disp="$3"
+  local path="$4"
+  local k
+  [[ -z "$path" ]] && return 0
+  k="$(canonical_worktree_key "$path")"
+  [[ -z "$k" ]] && k="$path"
+  [[ -n "${_wu_seen[$k]+x}" ]] && return 0
+  _wu_seen[$k]=1
+  _wu_opts+=("$disp")
+}
+
+# Display labels: "[last park] …", "[history …] …", or bare porcelain path.
 extract_path_from_pick() {
   local s="$1"
-  if [[ "$s" == '[history '* ]]; then
+  if [[ "$s" == "[last park] "* ]]; then
+    printf '%s\n' "${s#"[last park] "}"
+  elif [[ "$s" == '[history '* ]]; then
     s="${s#*] }"
     s="${s%%  (branch*}"
     printf '%s\n' "$s"
@@ -480,23 +493,38 @@ cmd_restore_stash_picker() {
   return 0
 }
 
+history_tsv_newest_first() {
+  local hf="$1"
+  [[ -f "$hf" ]] || return 0
+  if command -v tac >/dev/null 2>&1; then
+    tac "$hf"
+  else
+    tac_fallback_reverse "$hf"
+  fi
+}
+
 cmd_restore_worktree_picker() {
   local root="$1"
-  local hf line options=() lp
+  local hf line options=() lp dt path br int had disp
 
   hf="$(history_file)"
+  local -A seen_paths=()
 
   if lp="$(last_park_worktree_path 2>/dev/null)"; then
-    options+=("$lp")
+    wt_append_unique options seen_paths "[last park] $lp" "$lp"
   fi
 
   while IFS= read -r line; do
-    [[ -n "$line" ]] && options+=("$line")
+    [[ -n "$line" ]] && wt_append_unique options seen_paths "$line" "$line"
   done < <(worktree_paths_porcelain 2>/dev/null || true)
 
   while IFS= read -r line; do
-    [[ -n "$line" ]] && options+=("$line")
-  done < <(history_menu_lines "$hf")
+    [[ -z "$line" ]] && continue
+    IFS=$'\t' read -r dt path br int had <<<"$line" || true
+    [[ -z "$path" ]] && continue
+    disp="$(_history_format_line "$line")"
+    wt_append_unique options seen_paths "$disp" "$path"
+  done < <(history_tsv_newest_first "$hf")
 
   [[ ${#options[@]} -gt 0 ]] || {
     echo "No worktrees or saved park history. Run \`git-park park\` once, or add a worktree manually." >&2

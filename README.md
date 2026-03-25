@@ -45,7 +45,9 @@ git park
 Main menu:
 
 - **Park WIP** — prompts for worktree path and stash message, shows a **dry-run** summary, then asks for confirmation before changing anything.
-- **Restore** — (1) **Apply or pop a stash** into the **current worktree’s checkout**. After a successful `park`, the stash is usually **already applied** in the linked worktree, so the list is often empty — that is normal; use **git status** there. (2) **Show cd command** lists the primary clone, last park path, and other worktrees; paste the `cd …` line (clipboard copy is attempted when `wl-copy` / `xclip` / `xsel` / `pbcopy` exists). If you pick the directory you’re already in, the tool says so and skips redundant `cd`.
+- **Restore** — (1) **Apply or pop a stash** into the **current worktree’s checkout**. After a successful `park`, the stash is usually **already applied** in the linked worktree, so the list is often empty — that is normal; use **git status** there. (2) **Show cd command** lists the primary clone, last park path, and history-derived paths **deduplicated** (same path won’t appear three times). Paste the `cd …` line (clipboard copy is attempted when `wl-copy` / `xclip` / `xsel` / `pbcopy` exists). If you pick the directory you’re already in, the tool says so and skips redundant `cd`.
+
+**`git stash -u`:** the `park` step runs `git stash push -u`, which saves **staged + unstaged + untracked** files, then restores a clean tree so you can check out `main`. Ignored files (per `.gitignore`) stay ignored unless you also use `--all` (git-park does not). See `git help stash`.
 
 If your cwd is a **linked worktree**, you’ll see a short banner explaining that WIP is usually already there and stashes are often empty.
 - **Status** — worktrees, stashes, last park file, and recent **history** (last parks).
