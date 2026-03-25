@@ -27,10 +27,11 @@ command -v git-park
 git park help
 ```
 
-Optional short alias:
+Optional short shell alias — **avoid `gp` on Debian/Ubuntu** (that name is associated with **pari-gp**, and `command-not-found` will nag you to install it):
 
 ```bash
-alias gp='git park'
+alias gpark='git park'
+# or: alias gpk='git park'
 ```
 
 ### Interactive mode (default)
@@ -44,7 +45,9 @@ git park
 Main menu:
 
 - **Park WIP** — prompts for worktree path and stash message, shows a **dry-run** summary, then asks for confirmation before changing anything.
-- **Restore** — (1) **Apply or pop a stash** into the **current worktree’s checkout** (the repo root Git infers from your cwd). After a successful `park`, the stash is often already **popped** into the linked worktree, so the list may be empty — use (2) **Show cd command** instead. (2) Lists **last parked path** (from `wip-worktree-last`), registered worktrees, and history; **copy the printed `cd …` line** — a subprocess cannot change your shell’s cwd for you.
+- **Restore** — (1) **Apply or pop a stash** into the **current worktree’s checkout**. After a successful `park`, the stash is usually **already applied** in the linked worktree, so the list is often empty — that is normal; use **git status** there. (2) **Show cd command** lists the primary clone, last park path, and other worktrees; paste the `cd …` line (clipboard copy is attempted when `wl-copy` / `xclip` / `xsel` / `pbcopy` exists). If you pick the directory you’re already in, the tool says so and skips redundant `cd`.
+
+If your cwd is a **linked worktree**, you’ll see a short banner explaining that WIP is usually already there and stashes are often empty.
 - **Status** — worktrees, stashes, last park file, and recent **history** (last parks).
 - **Help** / **Quit**
 

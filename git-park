@@ -24,6 +24,37 @@ is_primary_worktree() {
   [[ "$gd" == "$cd_" ]]
 }
 
+current_branch_name() {
+  git branch --show-current 2>/dev/null || echo "(detached)"
+}
+
+# Print context when cwd is a linked worktree (not the primary checkout).
+hint_linked_worktree_if_needed() {
+  [[ -n "${GIT_PARK_HINTED_LINKED:-}" ]] && return 0
+  local root br
+  root="$(repo_root 2>/dev/null)" || return 0
+  [[ -n "$root" ]] || return 0
+  is_primary_worktree && return 0
+  br="$(current_branch_name)"
+  GIT_PARK_HINTED_LINKED=1
+  export GIT_PARK_HINTED_LINKED
+  echo "" >&2
+  echo "git-park: You’re in a linked worktree → $(printf '%q' "$root") (branch ${br})." >&2
+  echo "  After \`park\`, your WIP is usually already in this directory — use git status." >&2
+  echo "  Stashes are often empty here (stash was popped when the worktree was created)." >&2
+  echo "  Run \`park\` again only from the primary clone (checkout on main/master)." >&2
+  echo "" >&2
+}
+
+copy_shell_line_to_clipboard() {
+  local line="$1"
+  if command -v wl-copy >/dev/null 2>&1 && printf '%s' "$line" | wl-copy 2>/dev/null; then return 0; fi
+  if command -v xclip >/dev/null 2>&1 && printf '%s' "$line" | xclip -selection clipboard 2>/dev/null; then return 0; fi
+  if command -v xsel >/dev/null 2>&1 && printf '%s' "$line" | xsel --clipboard 2>/dev/null; then return 0; fi
+  if command -v pbcopy >/dev/null 2>&1 && printf '%s' "$line" | pbcopy 2>/dev/null; then return 0; fi
+  return 1
+}
+
 default_integration_branch() {
   if git show-ref --verify --quiet refs/heads/main; then echo main; return; fi
   if git show-ref --verify --quiet refs/heads/master; then echo master; return; fi
@@ -117,7 +148,8 @@ pick_from_strings() {
 park_precheck_inner() {
   PARK_ROOT="$(repo_root)" || { echo "git-park: not inside a git repository" >&2; return 1; }
   if ! is_primary_worktree; then
-    echo "git-park: run park from the primary clone (not a linked worktree)" >&2
+    echo "git-park: you’re in a linked worktree — \`park\` only runs from the primary clone" >&2
+    echo "  (the checkout whose .git is a directory, not a file). cd there and try again." >&2
     return 1
   fi
   local here
@@ -377,10 +409,20 @@ cmd_interactive_restore() {
     return 0
   fi
 
-  action="$(pick_from_strings "Restore — choose action" \
-    "Apply or pop a stash (into this worktree’s checkout)" \
-    "Show cd command (worktrees + saved parks — copy/paste into shell)" \
-    "Back")" || return 0
+  hint_linked_worktree_if_needed
+
+  # In linked worktrees, stash is usually empty after park — put “show cd” first.
+  if is_primary_worktree; then
+    action="$(pick_from_strings "Restore — choose action" \
+      "Apply or pop a stash (into this worktree’s checkout)" \
+      "Show cd command (worktrees + saved parks — copy/paste into shell)" \
+      "Back")" || return 0
+  else
+    action="$(pick_from_strings "Restore — linked worktree (stash often empty after park)" \
+      "Show cd command (primary clone + other paths)" \
+      "Apply or pop a stash (if you still have entries)" \
+      "Back")" || return 0
+  fi
 
   case "$action" in
     "Apply or pop a stash"*)
@@ -400,7 +442,12 @@ cmd_restore_stash_picker() {
   local stashes=()
   mapfile -t stashes < <(git -C "$root" stash list 2>/dev/null) || true
   [[ ${#stashes[@]} -gt 0 ]] || {
-    echo "No stashes in this repo. If you used \`park\`, changes may already live in the linked worktree — use Restore → Show cd command." >&2
+    if is_primary_worktree; then
+      echo "No stashes. After \`park\`, the stash was usually popped into the linked worktree — open that folder (Restore → Show cd) or check wip-worktree-last." >&2
+    else
+      echo "No stashes here — expected after \`park\` (stash was applied into this worktree when it was created)." >&2
+      echo "Your WIP is this working tree: run git status. To park again, cd to the primary clone on main/master." >&2
+    fi
     return 0
   }
 
@@ -462,11 +509,24 @@ cmd_restore_worktree_picker() {
   [[ -n "$path" ]] || path="$pick"
   path="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$path")"
 
+  local here cdline
+  here="$(pwd -P)"
+  cdline="cd $(printf '%q' "$path")"
+
   echo "" >&2
-  echo "This process cannot change your shell’s directory. Paste this:" >&2
+  if [[ "$here" == "$path" ]]; then
+    echo "git-park: You’re already in this directory — no cd needed." >&2
+    echo "  $(printf '%q' "$path")" >&2
+    return 0
+  fi
+
+  echo "Shells can’t cd from a subprocess — paste this (or use clipboard if noted):" >&2
   echo
-  echo "  cd $(printf '%q' "$path")"
+  echo "  $cdline"
   echo
+  if copy_shell_line_to_clipboard "$cdline"; then
+    echo "(also copied to clipboard)" >&2
+  fi
   if [[ -d "$path" ]]; then
     echo "(directory exists)"
   else
@@ -509,6 +569,8 @@ cmd_interactive_park() {
 }
 
 cmd_interactive() {
+  hint_linked_worktree_if_needed
+
   local choice
   if ! choice="$(pick_from_strings "git-park — pick one (↑↓ Enter, Esc = cancel)" \
     "Park WIP (stash + worktree, checkout main here)" \
