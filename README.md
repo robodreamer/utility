@@ -34,6 +34,56 @@ alias gpark='git park'
 # or: alias gpk='git park'
 ```
 
+### Repeatable shell setup (Bash)
+
+If you want this to work the same way on another machine, copy this block into `~/.bashrc`:
+
+```bash
+# git-park helpers
+export PATH="$HOME/utility:$PATH"
+
+# Base command alias
+alias gpark='git park'
+
+# Direct jump aliases (print path via git-park, then cd in current shell)
+alias parkcd='cd "$(git park go)"'
+alias parkhome='cd "$(git park home)"'
+
+# Day-to-day picker shortcut
+alias pgp='park go --pick'
+
+# Wrapper: make `park go` / `park home` perform actual cd
+park() {
+  case "${1:-}" in
+    home)
+      shift
+      cd "$(git park home "$@")" || return
+      ;;
+    go)
+      shift
+      cd "$(git park go "$@")" || return
+      ;;
+    *)
+      git park "$@"
+      ;;
+  esac
+}
+```
+
+Reload shell config:
+
+```bash
+source ~/.bashrc
+```
+
+Quick checks:
+
+```bash
+type park
+type pgp
+git park help
+```
+
 ### Interactive mode (default)
 
 ```bash
