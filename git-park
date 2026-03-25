@@ -1,0 +1,572 @@
+#!/usr/bin/env bash
+# Park uncommitted work on a linked worktree and switch the main clone to main.
+# State: wip-worktree-last, wip-save-history (git common dir). See ~/utility/README.md.
+set -euo pipefail
+
+STATE_NAME="wip-worktree-last"
+HISTORY_NAME="wip-save-history"
+DEFAULT_ROOT="${WIP_WORKTREE_ROOT:-$HOME/git-worktrees}"
+
+die() { echo "git-park: $*" >&2; exit 1; }
+
+have_fzf() { command -v fzf >/dev/null 2>&1; }
+
+repo_root() { git rev-parse --show-toplevel 2>/dev/null; }
+
+git_common_dir() {
+  git rev-parse --path-format=absolute --git-common-dir 2>/dev/null
+}
+
+is_primary_worktree() {
+  local gd cd_
+  gd="$(git rev-parse --path-format=absolute --git-dir 2>/dev/null)" || return 1
+  cd_="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)" || return 1
+  [[ "$gd" == "$cd_" ]]
+}
+
+default_integration_branch() {
+  if git show-ref --verify --quiet refs/heads/main; then echo main; return; fi
+  if git show-ref --verify --quiet refs/heads/master; then echo master; return; fi
+  git symbolic-ref -q refs/remotes/origin/HEAD 2>/dev/null | sed 's@^refs/remotes/origin/@@' || echo main
+}
+
+sanitize() {
+  local s="$1"
+  s="${s//\//-}"
+  s="${s//[^a-zA-Z0-9._-]/_}"
+  echo "$s"
+}
+
+state_file() {
+  local cd_
+  cd_="$(git_common_dir)" || die "not inside a git repository"
+  echo "$cd_/$STATE_NAME"
+}
+
+history_file() {
+  local cd_
+  cd_="$(git_common_dir)" || die "not inside a git repository"
+  echo "$cd_/$HISTORY_NAME"
+}
+
+append_history_line() {
+  local worktree_path="$1" branch="$2" integration="$3" had_stash="$4"
+  local hf d
+  hf="$(history_file)"
+  d="$(date -Iseconds 2>/dev/null || date)"
+  # TAB-separated; paths should not contain TAB
+  printf '%s\t%s\t%s\t%s\t%s\n' "$d" "$worktree_path" "$branch" "$integration" "$had_stash" >>"$hf"
+  chmod 600 "$hf" 2>/dev/null || true
+}
+
+write_state() {
+  local worktree_path="$1" branch="$2" integration="$3" had_stash="$4"
+  local f
+  f="$(state_file)"
+  umask 077
+  cat >"$f" <<EOF
+# Written by git-park — safe to delete
+WORKTREE_PATH=$worktree_path
+BRANCH=$branch
+INTEGRATION_BRANCH=$integration
+HAD_STASH=$had_stash
+DATE=$(date -Iseconds 2>/dev/null || date)
+EOF
+  echo "Recorded: $f"
+  append_history_line "$worktree_path" "$branch" "$integration" "$had_stash"
+}
+
+# Pick one line from arguments; prints selection to stdout. Returns 1 on cancel / empty.
+pick_from_strings() {
+  local header="$1"
+  shift
+  [[ $# -gt 0 ]] || return 1
+  if have_fzf; then
+    printf '%s\n' "$@" | fzf \
+      --height=14 \
+      --layout=reverse \
+      --border=rounded \
+      --header="$header" \
+      --prompt="> "
+  else
+    echo "" >&2
+    echo "git-park: $header" >&2
+    echo "(Install fzf for arrow-key selection: https://github.com/junegunn/fzf)" >&2
+    echo "" >&2
+    local i=1 opt
+    for opt in "$@"; do
+      echo "  $i) $opt" >&2
+      ((i++)) || true
+    done
+    echo "  0) Cancel" >&2
+    local n
+    read -r -p "Enter number: " n </dev/tty || return 1
+    [[ -n "${n:-}" ]] || return 1
+    [[ "$n" == "0" ]] && return 1
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )); then
+      eval "printf '%s\n' \"\${$n}\""
+    else
+      return 1
+    fi
+  fi
+}
+
+# --- park: shared precheck + execution ---
+
+# Returns 0 and sets PARK_* vars, or returns 1 and prints reason to stderr.
+park_precheck_inner() {
+  PARK_ROOT="$(repo_root)" || { echo "git-park: not inside a git repository" >&2; return 1; }
+  if ! is_primary_worktree; then
+    echo "git-park: run park from the primary clone (not a linked worktree)" >&2
+    return 1
+  fi
+  local here
+  here="$(pwd -P)"
+  if [[ "$here" != "$PARK_ROOT"/* && "$here" != "$PARK_ROOT" ]]; then
+    echo "git-park: run from inside the repository (repo root: $PARK_ROOT)" >&2
+    return 1
+  fi
+
+  PARK_BRANCH="$(git -C "$PARK_ROOT" branch --show-current 2>/dev/null)" || true
+  if [[ -z "${PARK_BRANCH:-}" ]]; then
+    echo "git-park: detached HEAD — checkout a branch before parking" >&2
+    return 1
+  fi
+
+  if [[ -n "${PARK_INTEGRATION_OVERRIDE:-}" ]]; then
+    PARK_INTEGRATION="$PARK_INTEGRATION_OVERRIDE"
+  else
+    PARK_INTEGRATION="$(default_integration_branch)"
+  fi
+  if [[ "$PARK_BRANCH" == "$PARK_INTEGRATION" ]]; then
+    echo "git-park: on '$PARK_INTEGRATION' — checkout your feature branch first" >&2
+    return 1
+  fi
+
+  PARK_REPO_BASE="$(basename "$PARK_ROOT")"
+  PARK_SAFE_BRANCH="$(sanitize "$PARK_BRANCH")"
+  PARK_DEFAULT_WT="$DEFAULT_ROOT/${PARK_REPO_BASE}-${PARK_SAFE_BRANCH}"
+
+  local dirty
+  dirty="$(git -C "$PARK_ROOT" status --porcelain)"
+  if [[ -n "$dirty" ]]; then PARK_HAD_STASH=1; else PARK_HAD_STASH=0; fi
+  return 0
+}
+
+park_precheck_or_die() {
+  park_precheck_inner || exit 1
+}
+
+park_run() {
+  local worktree_path="$1" msg_suffix="$2" dry_run="$3"
+  local stash_msg="git-park: $msg_suffix"
+
+  echo "Repo:       $PARK_ROOT"
+  echo "WIP branch: $PARK_BRANCH"
+  echo "This clone will checkout: $PARK_INTEGRATION"
+  echo "Worktree:   $worktree_path"
+  [[ "$PARK_HAD_STASH" -eq 1 ]] && echo "Stash:      yes (-u)" || echo "Stash:      (clean — skip stash/pop)"
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    echo "[dry-run] no changes made"
+    return 0
+  fi
+
+  mkdir -p "$(dirname "$worktree_path")"
+
+  if [[ "$PARK_HAD_STASH" -eq 1 ]]; then
+    git -C "$PARK_ROOT" stash push -u -m "$stash_msg"
+  fi
+
+  git -C "$PARK_ROOT" checkout "$PARK_INTEGRATION"
+
+  if [[ -e "$worktree_path" ]]; then
+    die "path already exists: $worktree_path — remove it or pass a different WORKTREE_PATH"
+  fi
+
+  git -C "$PARK_ROOT" worktree add "$worktree_path" "$PARK_BRANCH"
+
+  if [[ "$PARK_HAD_STASH" -eq 1 ]]; then
+    if git -C "$worktree_path" stash pop; then
+      :
+    else
+      echo "git-park: stash pop reported conflicts or failed." >&2
+      echo "  Worktree: $worktree_path" >&2
+      echo "  Resolve conflicts, then: git stash drop (if pop left an entry)" >&2
+      exit 1
+    fi
+  fi
+
+  write_state "$worktree_path" "$PARK_BRANCH" "$PARK_INTEGRATION" "$PARK_HAD_STASH"
+
+  echo
+  echo "Done. Continue WIP in:"
+  echo "  cd $(printf '%q' "$worktree_path")"
+  echo "Reminder: git-park status  (from any worktree of this repo)"
+}
+
+cmd_help() {
+  cat <<'EOF'
+git-park — park WIP in a second worktree; switch main clone to main
+
+With git-park on your PATH, Git also accepts the same commands as:
+  git park …                (same as git-park …)
+
+Usage:
+  git-park                  interactive menu (arrow keys if fzf installed)
+  git-park park [OPTIONS] [WORKTREE_PATH]
+  git-park restore          pick stash or saved worktree (interactive)
+  git-park status
+  git-park help
+
+park:
+  - Stashes all changes (including untracked) on the current branch.
+  - Checks out the integration branch (main/master) in this clone.
+  - Adds a linked worktree at WORKTREE_PATH for the branch you were on.
+  - Pops the stash inside that worktree.
+  - Saves WORKTREE_PATH and appends wip-save-history.
+
+restore:
+  - Stash: apply/pop affects the worktree that contains your cwd (repo root).
+    After `park`, stashes are often already applied in the linked worktree — list may be empty.
+  - Show cd: prints a copy-pastable `cd` (last park, worktrees, history). Subprocesses cannot cd your shell.
+
+Options (park):
+  -i, --integration BRANCH   Branch to leave this clone on (default: main or master)
+  -m, --message TEXT         Stash message suffix (default: branch name + date)
+  -n, --dry-run              Print what would happen; make no changes
+
+Environment:
+  WIP_WORKTREE_ROOT          Default parent dir when WORKTREE_PATH is omitted
+
+UI:
+  Install fzf for arrow-key menus. Without fzf, numbered prompts are used.
+
+More: ~/utility/README.md
+EOF
+}
+
+cmd_status() {
+  local root sf hf
+  root="$(repo_root)" || die "not inside a git repository"
+  echo "=== worktrees ==="
+  git -C "$root" worktree list
+  echo
+  echo "=== stash list ==="
+  git -C "$root" stash list || true
+  sf="$(state_file)"
+  if [[ -f "$sf" ]]; then
+    echo
+    echo "=== last park ($sf) ==="
+    cat "$sf"
+  else
+    echo
+    echo "(no $STATE_NAME yet — run \`git-park park\` once)"
+  fi
+  hf="$(history_file)"
+  if [[ -f "$hf" ]]; then
+    echo
+    echo "=== recent park history (newest first, last 8) ==="
+    if command -v tac >/dev/null 2>&1; then
+      tac "$hf" | head -n 8
+    else
+      tac_fallback_reverse "$hf" | head -n 8
+    fi
+  fi
+}
+
+cmd_park() {
+  local integration="" msg_suffix="" dry_run=0 worktree_path=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -i|--integration) integration="${2:-}"; shift 2 || die "missing value for $1";;
+      -m|--message) msg_suffix="${2:-}"; shift 2 || die "missing value for $1";;
+      -n|--dry-run) dry_run=1; shift;;
+      -h|--help) cmd_help; exit 0;;
+      -* ) die "unknown option: $1 (try: git-park help)";;
+      *) worktree_path="$1"; shift; break;;
+    esac
+  done
+  [[ $# -eq 0 ]] || die "unexpected arguments: $*"
+
+  PARK_INTEGRATION_OVERRIDE="$integration"
+  park_precheck_or_die
+  unset PARK_INTEGRATION_OVERRIDE
+
+  [[ -n "$worktree_path" ]] || worktree_path="$PARK_DEFAULT_WT"
+
+  if [[ -z "$msg_suffix" ]]; then
+    msg_suffix="$PARK_BRANCH $(date -Iminutes 2>/dev/null || date)"
+  fi
+
+  park_run "$worktree_path" "$msg_suffix" "$dry_run"
+}
+
+worktree_paths_porcelain() {
+  local root
+  root="$(repo_root)" || return 1
+  git -C "$root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}'
+}
+
+history_menu_lines() {
+  local hf="$1"
+  [[ -f "$hf" ]] || return 0
+  local line
+  if command -v tac >/dev/null 2>&1; then
+    while IFS= read -r line; do
+      _history_format_line "$line"
+    done < <(tac "$hf")
+  else
+    # shellcheck disable=SC2016
+    tac_fallback_reverse "$hf" | while IFS= read -r line; do _history_format_line "$line"; done
+  fi
+}
+
+tac_fallback_reverse() {
+  local f="$1"
+  mapfile -t _hist_lines <"$f"
+  local i
+  for (( i=${#_hist_lines[@]}-1; i>=0; i-- )); do
+    printf '%s\n' "${_hist_lines[i]}"
+  done
+}
+
+_history_format_line() {
+  local line="$1"
+  [[ -n "$line" ]] || return 0
+  IFS=$'\t' read -r dt path br int had <<<"$line" || true
+  printf '[history %s] %s  (branch %s → %s)\n' "$dt" "$path" "$br" "$int"
+}
+
+# History display: "[history DATE] /path  (branch …)"; porcelain / last-park lines are a bare path.
+extract_path_from_pick() {
+  local s="$1"
+  if [[ "$s" == '[history '* ]]; then
+    s="${s#*] }"
+    s="${s%%  (branch*}"
+    printf '%s\n' "$s"
+  else
+    printf '%s\n' "$s"
+  fi
+}
+
+# Parse "stash@{n}: …" (bash regex; avoids sed BRE issues across platforms).
+parse_stash_ref_from_line() {
+  local line="$1"
+  if [[ "$line" =~ ^(stash@\{[0-9]+\}): ]]; then
+    printf '%s\n' "${BASH_REMATCH[1]}"
+    return 0
+  fi
+  return 1
+}
+
+# Source WORKTREE_PATH= from wip-worktree-last if present.
+last_park_worktree_path() {
+  local sf p
+  sf="$(state_file)"
+  [[ -f "$sf" ]] || return 1
+  p="$(grep '^WORKTREE_PATH=' "$sf" 2>/dev/null | sed 's/^WORKTREE_PATH=//')" || return 1
+  [[ -n "$p" ]] || return 1
+  printf '%s\n' "$p"
+}
+
+cmd_interactive_restore() {
+  local root action
+  if ! root="$(repo_root)" || [[ -z "$root" ]]; then
+    echo "git-park: not inside a git repository — cd into a clone first." >&2
+    return 0
+  fi
+
+  action="$(pick_from_strings "Restore — choose action" \
+    "Apply or pop a stash (into this worktree’s checkout)" \
+    "Show cd command (worktrees + saved parks — copy/paste into shell)" \
+    "Back")" || return 0
+
+  case "$action" in
+    "Apply or pop a stash"*)
+      cmd_restore_stash_picker "$root" || true
+      ;;
+    "Show cd command"*)
+      cmd_restore_worktree_picker "$root" || true
+      ;;
+    Back*) return 0 ;;
+    *) return 0 ;;
+  esac
+  return 0
+}
+
+cmd_restore_stash_picker() {
+  local root="$1"
+  local stashes=()
+  mapfile -t stashes < <(git -C "$root" stash list 2>/dev/null) || true
+  [[ ${#stashes[@]} -gt 0 ]] || {
+    echo "No stashes in this repo. If you used \`park\`, changes may already live in the linked worktree — use Restore → Show cd command." >&2
+    return 0
+  }
+
+  local pick
+  pick="$(pick_from_strings "Pick a stash (↑↓ Enter, Esc cancel)" "${stashes[@]}")" || return 0
+
+  local ref
+  if ! ref="$(parse_stash_ref_from_line "$pick")"; then
+    echo "git-park: could not parse stash ref from line — report this line: $pick" >&2
+    return 0
+  fi
+
+  local how
+  how="$(pick_from_strings "Apply keeps stash entry; pop removes it" "apply" "pop" "Cancel")" || return 0
+  [[ "$how" == Cancel* ]] && return 0
+
+  if [[ "$how" == "pop" ]]; then
+    if ! git -C "$root" stash pop "$ref"; then
+      echo "git-park: stash pop failed (conflicts or dirty tree?). Fix with git status, then retry." >&2
+      return 0
+    fi
+    echo "OK: popped $ref into $(printf '%q' "$root")"
+  else
+    if ! git -C "$root" stash apply "$ref"; then
+      echo "git-park: stash apply failed (conflicts or dirty tree?). Fix with git status, then retry." >&2
+      return 0
+    fi
+    echo "OK: applied $ref into $(printf '%q' "$root")"
+  fi
+  return 0
+}
+
+cmd_restore_worktree_picker() {
+  local root="$1"
+  local hf line options=() lp
+
+  hf="$(history_file)"
+
+  if lp="$(last_park_worktree_path 2>/dev/null)"; then
+    options+=("$lp")
+  fi
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && options+=("$line")
+  done < <(worktree_paths_porcelain 2>/dev/null || true)
+
+  while IFS= read -r line; do
+    [[ -n "$line" ]] && options+=("$line")
+  done < <(history_menu_lines "$hf")
+
+  [[ ${#options[@]} -gt 0 ]] || {
+    echo "No worktrees or saved park history. Run \`git-park park\` once, or add a worktree manually." >&2
+    return 0
+  }
+
+  local pick path
+  pick="$(pick_from_strings "Pick path — copy the cd line below (↑↓ Enter)" "${options[@]}")" || return 0
+  path="$(extract_path_from_pick "$pick")"
+  [[ -n "$path" ]] || path="$pick"
+  path="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$path")"
+
+  echo "" >&2
+  echo "This process cannot change your shell’s directory. Paste this:" >&2
+  echo
+  echo "  cd $(printf '%q' "$path")"
+  echo
+  if [[ -d "$path" ]]; then
+    echo "(directory exists)"
+  else
+    echo "(warning: path not found — remove stale worktree with: git worktree remove …)" >&2
+  fi
+  return 0
+}
+
+cmd_interactive_park() {
+  PARK_INTEGRATION_OVERRIDE=""
+  if ! park_precheck_inner; then
+    echo "Park needs the primary clone on a feature branch (not main/master)." >&2
+    echo "Tip: git switch <your-branch>  then run this again." >&2
+    read -r -p "Press Enter…" </dev/tty || true
+    return 0
+  fi
+
+  local wt msg
+  wt="$PARK_DEFAULT_WT"
+  echo "" >&2
+  echo "Default worktree path:" >&2
+  echo "  $wt" >&2
+  read -r -e -p "Path [Enter = default]: " -i "$wt" wt_input </dev/tty || true
+  wt="${wt_input:-$wt}"
+
+  msg="$PARK_BRANCH $(date -Iminutes 2>/dev/null || date)"
+  read -r -e -p "Stash message suffix [Enter = default]: " -i "$msg" msg_input </dev/tty || true
+  msg="${msg_input:-$msg}"
+
+  echo "" >&2
+  park_run "$wt" "$msg" 1
+  echo "" >&2
+  local yn
+  read -r -p "Proceed for real? [y/N] " yn </dev/tty || true
+  if [[ "${yn:-}" == [yY] ]] || [[ "${yn:-}" == [yY][eE][sS] ]]; then
+    park_run "$wt" "$msg" 0
+  else
+    echo "Cancelled." >&2
+  fi
+}
+
+cmd_interactive() {
+  local choice
+  if ! choice="$(pick_from_strings "git-park — pick one (↑↓ Enter, Esc = cancel)" \
+    "Park WIP (stash + worktree, checkout main here)" \
+    "Restore (stash apply/pop or show cd to worktree)" \
+    "Status" \
+    "Help" \
+    "Quit")"; then
+    echo "Cancelled."
+    return 0
+  fi
+
+  case "$choice" in
+    "Park WIP"*)
+      if repo_root >/dev/null 2>&1; then
+        cmd_interactive_park || true
+      else
+        echo "Not in a git repo. cd into your project first." >&2
+      fi
+      ;;
+    "Restore"*)
+      if repo_root >/dev/null 2>&1; then
+        cmd_interactive_restore || true
+      else
+        echo "Not in a git repo." >&2
+      fi
+      ;;
+    Status)
+      if repo_root >/dev/null 2>&1; then
+        cmd_status || true
+      else
+        echo "Not in a git repo." >&2
+      fi
+      ;;
+    Help)
+      cmd_help
+      ;;
+    Quit*)
+      echo "Bye."
+      ;;
+  esac
+  return 0
+}
+
+main() {
+  if [[ $# -eq 0 ]] || [[ "${1:-}" == "menu" ]] || [[ "${1:-}" == "i" ]] || [[ "${1:-}" == "interactive" ]]; then
+    cmd_interactive
+    exit 0
+  fi
+
+  local cmd="$1"
+  shift || true
+  case "$cmd" in
+    park) cmd_park "$@" ;;
+    restore) cmd_interactive_restore || true ;;
+    status) cmd_status ;;
+    help|-h|--help) cmd_help ;;
+    *) die "unknown command: $cmd — try: git-park help" ;;
+  esac
+}
+
+main "$@"
