@@ -234,7 +234,8 @@ park_run() {
   echo
   echo "Done. Continue WIP in:"
   echo "  cd $(printf '%q' "$worktree_path")"
-  echo "Reminder: git-park status  (from any worktree of this repo)"
+  echo "Reminder: git-park status  (from any worktree of this repo)" >&2
+  echo "Jump here in one shot: cd \"\$(git park go)\"" >&2
 }
 
 cmd_help() {
@@ -248,6 +249,7 @@ Usage:
   git-park                  interactive menu (arrow keys if fzf installed)
   git-park park [OPTIONS] [WORKTREE_PATH]
   git-park restore          pick stash or saved worktree (interactive)
+  git-park go [--pick] [PATH]   print path only — use: cd "$(git park go)"
   git-park status
   git-park help
 
@@ -262,6 +264,11 @@ restore:
   - Stash: apply/pop affects the worktree that contains your cwd (repo root).
     After `park`, stashes are often already applied in the linked worktree — list may be empty.
   - Show cd: copy-pastable `cd`; list is last park, then worktrees, then history (deduped by path).
+
+go:
+  - Prints **only** a directory path on stdout (for `cd "$(git park go)"`). Not a subprocess cd;
+    your shell runs cd after reading the path.
+  - Default: WORKTREE_PATH from wip-worktree-last. `--pick`: interactive list. Optional PATH argument.
 
 Options (park):
   -i, --integration BRANCH   Branch to leave this clone on (default: main or master)
@@ -503,19 +510,20 @@ history_tsv_newest_first() {
   fi
 }
 
-cmd_restore_worktree_picker() {
-  local root="$1"
-  local hf line options=() lp dt path br int had disp
+# Fill option labels + dedupe keys. Args: name_of_opts_array name_of_seen_assoc (both empty from caller).
+fill_worktree_pick_options() {
+  local _opts_name="$1"
+  local _seen_name="$2"
+  local hf line lp dt path br int had disp
 
   hf="$(history_file)"
-  local -A seen_paths=()
 
   if lp="$(last_park_worktree_path 2>/dev/null)"; then
-    wt_append_unique options seen_paths "[last park] $lp" "$lp"
+    wt_append_unique "$_opts_name" "$_seen_name" "[last park] $lp" "$lp"
   fi
 
   while IFS= read -r line; do
-    [[ -n "$line" ]] && wt_append_unique options seen_paths "$line" "$line"
+    [[ -n "$line" ]] && wt_append_unique "$_opts_name" "$_seen_name" "$line" "$line"
   done < <(worktree_paths_porcelain 2>/dev/null || true)
 
   while IFS= read -r line; do
@@ -523,15 +531,79 @@ cmd_restore_worktree_picker() {
     IFS=$'\t' read -r dt path br int had <<<"$line" || true
     [[ -z "$path" ]] && continue
     disp="$(_history_format_line "$line")"
-    wt_append_unique options seen_paths "$disp" "$path"
+    wt_append_unique "$_opts_name" "$_seen_name" "$disp" "$path"
   done < <(history_tsv_newest_first "$hf")
+}
+
+# stdout: single absolute path only. stderr: errors. For: cd "$(git park go)"
+cmd_go() {
+  local pick=0
+  local explicit=""
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pick) pick=1; shift;;
+      -h|--help)
+        cat <<'EOF' >&2
+git-park go — print worktree path for your shell to cd into
+
+  cd "$(git park go)"              # last path from wip-worktree-last
+  cd "$(git park go --pick)"       # choose from same list as Restore → Show cd
+
+Optional explicit directory (must exist):
+  cd "$(git park go /path/to/worktree)"
+
+A subprocess cannot change your shell’s cwd; this prints only the path on stdout.
+EOF
+        return 0
+        ;;
+      --) shift; break;;
+      -* ) die "go: unknown option: $1 (try: git-park go --help)";;
+      *) explicit="${1:-}"; shift; break;;
+    esac
+  done
+  [[ $# -eq 0 ]] || die "go: unexpected argument: $*"
+
+  local root path pick_line lastp
+  root="$(repo_root)" || { echo "git-park go: not inside a git repository" >&2; return 1; }
+
+  if [[ -n "$explicit" ]]; then
+    path="$explicit"
+  elif [[ "$pick" -eq 1 ]]; then
+    local -a options=()
+    local -A seen_paths=()
+    fill_worktree_pick_options options seen_paths
+    [[ ${#options[@]} -gt 0 ]] || { echo "git-park go: no worktrees or park history" >&2; return 1; }
+    pick_line="$(pick_from_strings "git-park go — pick destination (↑↓ Enter)" "${options[@]}")" || return 1
+    path="$(extract_path_from_pick "$pick_line")"
+    [[ -n "$path" ]] || path="$pick_line"
+  else
+    path="$(last_park_worktree_path 2>/dev/null)" || true
+    [[ -n "${path:-}" ]] || { echo "git-park go: no wip-worktree-last — run \`git-park park\` once or use --pick" >&2; return 1; }
+  fi
+
+  path="$(sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' <<<"$path")"
+  if command -v realpath >/dev/null 2>&1; then
+    path="$(realpath -m "$path" 2>/dev/null || printf '%s\n' "$path")"
+  fi
+
+  [[ -d "$path" ]] || { echo "git-park go: not a directory: $path" >&2; return 1; }
+  printf '%s\n' "$path"
+  return 0
+}
+
+cmd_restore_worktree_picker() {
+  local root="$1"
+  local -a options=()
+  local -A seen_paths=()
+
+  fill_worktree_pick_options options seen_paths
 
   [[ ${#options[@]} -gt 0 ]] || {
     echo "No worktrees or saved park history. Run \`git-park park\` once, or add a worktree manually." >&2
     return 0
   }
 
-  local pick path
+  local pick path lastp
   pick="$(pick_from_strings "Pick path — copy the cd line below (↑↓ Enter)" "${options[@]}")" || return 0
   path="$(extract_path_from_pick "$pick")"
   [[ -n "$path" ]] || path="$pick"
@@ -540,6 +612,7 @@ cmd_restore_worktree_picker() {
   local here cdline
   here="$(pwd -P)"
   cdline="cd $(printf '%q' "$path")"
+  lastp="$(last_park_worktree_path 2>/dev/null || true)"
 
   echo "" >&2
   if [[ "$here" == "$path" ]]; then
@@ -552,6 +625,12 @@ cmd_restore_worktree_picker() {
   echo
   echo "  $cdline"
   echo
+  if [[ -n "${lastp:-}" ]] && [[ "$(canonical_worktree_key "$path")" == "$(canonical_worktree_key "$lastp")" ]]; then
+    echo "One-liner next time: cd \"\$(git park go)\"" >&2
+  else
+    echo "One-liner (after this pick): cd \"\$(git park go --pick)\"" >&2
+  fi
+  echo "" >&2
   if copy_shell_line_to_clipboard "$cdline"; then
     echo "(also copied to clipboard)" >&2
   fi
@@ -652,6 +731,7 @@ main() {
   shift || true
   case "$cmd" in
     park) cmd_park "$@" ;;
+    go) cmd_go "$@" ;;
     restore) cmd_interactive_restore || true ;;
     status) cmd_status ;;
     help|-h|--help) cmd_help ;;
