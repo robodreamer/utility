@@ -9,6 +9,8 @@ DEFAULT_ROOT="${WIP_WORKTREE_ROOT:-$HOME/git-worktrees}"
 
 die() { echo "git-park: $*" >&2; exit 1; }
 
+have_tty() { [[ -t 0 || -t 1 || -t 2 ]] && [[ -r /dev/tty ]]; }
+
 have_fzf() { command -v fzf >/dev/null 2>&1; }
 
 repo_root() { git rev-parse --show-toplevel 2>/dev/null; }
@@ -113,7 +115,7 @@ pick_from_strings() {
   local header="$1"
   shift
   [[ $# -gt 0 ]] || return 1
-  if have_fzf; then
+  if have_fzf && have_tty; then
     printf '%s\n' "$@" | fzf \
       --height=14 \
       --layout=reverse \
@@ -132,15 +134,51 @@ pick_from_strings() {
     done
     echo "  0) Cancel" >&2
     local n
-    read -r -p "Enter number: " n </dev/tty || return 1
+    have_tty || { echo "git-park: interactive selection needs a terminal" >&2; return 1; }
+    read -r -p "Enter number [0=cancel]: " n </dev/tty || return 1
     [[ -n "${n:-}" ]] || return 1
     [[ "$n" == "0" ]] && return 1
     if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )); then
       eval "printf '%s\n' \"\${$n}\""
     else
+      echo "git-park: invalid selection" >&2
       return 1
     fi
   fi
+}
+
+confirm_remove_with_force() {
+  local target="$1"
+  local header=$'Worktree has modified or untracked files.\nRemoving it with --force may discard uncommitted changes.\n'
+  header+="Path: $target"
+
+  if have_fzf && have_tty; then
+    local choice
+    choice="$(printf '%s\n' "Cancel" "Force remove" | fzf \
+      --height=8 \
+      --layout=reverse \
+      --border=rounded \
+      --header="$header" \
+      --prompt="> ")" || return 1
+    [[ "$choice" == "Force remove" ]]
+    return
+  fi
+
+  local yn
+  echo "" >&2
+  echo "git-park: worktree has modified or untracked files:" >&2
+  echo "  $target" >&2
+  echo "Removing it with --force may discard uncommitted changes." >&2
+  have_tty || { echo "git-park: cannot prompt without a terminal; rerun with --force if you are sure" >&2; return 1; }
+  read -r -p "Force remove this worktree? [y/N] " yn </dev/tty || return 1
+  [[ "${yn:-}" == [yY] ]] || [[ "${yn:-}" == [yY][eE][sS] ]]
+}
+
+worktree_has_uncommitted_changes() {
+  local target="$1"
+  [[ -d "$target" ]] || return 1
+  [[ -d "$target/.git" || -f "$target/.git" ]] || return 1
+  [[ -n "$(git -C "$target" status --porcelain --untracked-files=all 2>/dev/null || true)" ]]
 }
 
 # --- park: shared precheck + execution ---
@@ -630,8 +668,22 @@ cmd_remove() {
   (( force == 1 )) && fflag=( -f ) || true
 
   if [[ -d "$target" ]]; then
-    if ! git -C "$root" worktree remove "${fflag[@]}" "$target"; then
-      echo "git-park remove: git worktree remove ${fflag[*]} $target failed. Use --force if needed." >&2
+    if (( force == 0 )) && worktree_has_uncommitted_changes "$target"; then
+      if confirm_remove_with_force "$target"; then
+        fflag=(-f)
+      else
+        echo "git-park remove: cancelled" >&2
+        return 1
+      fi
+    fi
+
+    if ! remove_output="$(git -C "$root" worktree remove "${fflag[@]}" "$target" 2>&1)"; then
+      echo "$remove_output" >&2
+      if (( force == 0 )) && [[ "${fflag[*]:-}" != *"-f"* ]]; then
+        echo "git-park remove: git worktree remove ${fflag[*]} $target failed. Use --force if needed." >&2
+        return 1
+      fi
+      echo "git-park remove: git worktree remove ${fflag[*]} $target failed." >&2
       return 1
     fi
   else

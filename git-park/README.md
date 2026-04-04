@@ -141,7 +141,7 @@ Same one-shot menu: `git park menu`, `git park i`, or `git park interactive`.
 |--------|---------|
 | `git park park` | Stash (`-u`), checkout integration branch here, add worktree, stash pop there, record path + history. |
 | `git park restore` | Opens only the **Restore** flow (stash or `cd` helper). |
-| `git park remove` | Remove a non-primary linked worktree (never the main clone). Supports `--pick` and `--force`. |
+| `git park remove` | Remove a non-primary linked worktree (never the main clone). Supports `--pick` and `--force`; if removal is blocked by modified/untracked files, it now prompts to confirm a force-remove. |
 | `git park go` | Print **only** the last parked worktree path (stdout) — for `cd "$(git park go)"`. |
 | `git park go --pick` | Print path after interactive pick (same options as Restore → Show cd). |
 | `git park go /path/to/wt` | Print that path if it’s an existing directory (sanity check). |
