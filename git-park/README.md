@@ -96,6 +96,7 @@ Main menu:
 
 - **Park WIP** — prompts for worktree path and stash message, shows a **dry-run** summary, then asks for confirmation before changing anything.
 - **Restore** — (1) **Apply or pop a stash** into the **current worktree’s checkout**. After a successful `park`, the stash is usually **already applied** in the linked worktree, so the list is often empty — that is normal; use **git status** there. (2) **Show cd command** lists **`[primary]`** (main clone), **`[last park]`**, other worktrees, and history — **deduplicated** by path. Paste the `cd …` line (clipboard copy is attempted when `wl-copy` / `xclip` / `xsel` / `pbcopy` exists). If you pick the directory you’re already in, the tool says so and skips redundant `cd`.
+- **Remove worktree** — pick a non-primary linked worktree and remove it (never removes the primary). Use this to clean up parked or stale worktrees.
 - **Status** — worktrees, stashes, last park file, and recent **history** (last parks).
 - **Help** / **Quit**
 
@@ -140,6 +141,7 @@ Same one-shot menu: `git park menu`, `git park i`, or `git park interactive`.
 |--------|---------|
 | `git park park` | Stash (`-u`), checkout integration branch here, add worktree, stash pop there, record path + history. |
 | `git park restore` | Opens only the **Restore** flow (stash or `cd` helper). |
+| `git park remove` | Remove a non-primary linked worktree (never the main clone). Supports `--pick` and `--force`. |
 | `git park go` | Print **only** the last parked worktree path (stdout) — for `cd "$(git park go)"`. |
 | `git park go --pick` | Print path after interactive pick (same options as Restore → Show cd). |
 | `git park go /path/to/wt` | Print that path if it’s an existing directory (sanity check). |
