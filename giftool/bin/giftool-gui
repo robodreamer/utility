@@ -1,0 +1,611 @@
+#!/usr/bin/env python3
+import subprocess
+import threading
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, ttk
+
+from PIL import Image, ImageOps, ImageSequence, ImageTk
+
+try:
+    RESAMPLE_LANCZOS = Image.Resampling.LANCZOS
+except AttributeError:
+    RESAMPLE_LANCZOS = Image.LANCZOS
+
+
+class GifToolGUI:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title("GIF Tool")
+        self.root.geometry("900x760")
+
+        self.input_path = tk.StringVar()
+        self.output_path = tk.StringVar()
+        self.start_var = tk.DoubleVar(value=0.0)
+        self.end_var = tk.DoubleVar(value=0.0)
+        self.scrub_var = tk.DoubleVar(value=0.0)
+        self.width_var = tk.StringVar()
+        self.height_var = tk.StringVar()
+        self.resize_percent_var = tk.DoubleVar(value=100.0)
+        self.resize_mode_var = tk.StringVar(value="pixels")
+        self.fps_var = tk.StringVar()
+        self.loop_var = tk.StringVar(value="0")
+        self.status_var = tk.StringVar(value="Open an animated GIF to begin.")
+        self.source_size_var = tk.StringVar(value="Source: -")
+        self.output_size_var = tk.StringVar(value="Output: -")
+
+        self.frames = []
+        self.preview_images = []
+        self.frame_starts = []
+        self.frame_durations = []
+        self.total_duration = 0.0
+        self.current_index = 0
+        self.preview_job = None
+        self.render_thread = None
+        self.preview_size = (560, 420)
+        self.is_playing = True
+        self.scrub_lock = False
+        self.resize_lock = False
+
+        self._build_ui()
+        self.width_var.trace_add("write", self.on_width_changed)
+        self.height_var.trace_add("write", self.on_height_changed)
+        self.resize_percent_var.trace_add("write", self.on_percent_changed)
+        self.resize_mode_var.trace_add("write", self.on_resize_mode_changed)
+        self._configure_file_dialog_defaults()
+
+    def _build_ui(self) -> None:
+        main = ttk.Frame(self.root, padding=12)
+        main.pack(fill="both", expand=True)
+
+        file_box = ttk.LabelFrame(main, text="Files", padding=10)
+        file_box.pack(fill="x")
+        ttk.Label(file_box, text="Input").grid(row=0, column=0, sticky="w")
+        ttk.Entry(file_box, textvariable=self.input_path).grid(row=0, column=1, sticky="ew", padx=8)
+        ttk.Button(file_box, text="Open GIF", command=self.open_gif).grid(row=0, column=2)
+        ttk.Label(file_box, text="Output").grid(row=1, column=0, sticky="w", pady=(8, 0))
+        ttk.Entry(file_box, textvariable=self.output_path).grid(row=1, column=1, sticky="ew", padx=8, pady=(8, 0))
+        ttk.Button(file_box, text="Save As", command=self.choose_output).grid(row=1, column=2, pady=(8, 0))
+        file_box.columnconfigure(1, weight=1)
+
+        preview_box = ttk.LabelFrame(main, text="Preview", padding=10)
+        preview_box.pack(fill="both", expand=True, pady=(12, 0))
+        self.preview_label = ttk.Label(preview_box, anchor="center")
+        self.preview_label.pack(fill="both", expand=True)
+        self.meta_label = ttk.Label(preview_box, text="No GIF loaded.")
+        self.meta_label.pack(anchor="w", pady=(8, 0))
+        self.scrub_scale = ttk.Scale(
+            preview_box,
+            from_=0.0,
+            to=0.0,
+            variable=self.scrub_var,
+            command=self.on_scrub_changed,
+        )
+        self.scrub_scale.pack(fill="x", pady=(10, 0))
+        controls = ttk.Frame(preview_box)
+        controls.pack(fill="x", pady=(8, 0))
+        ttk.Button(controls, text="|< Trim Start", command=self.jump_to_trim_start).pack(side="left")
+        ttk.Button(controls, text="< Prev", command=self.prev_frame).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Play", command=self.play_preview).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Pause", command=self.pause_preview).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Next >", command=self.next_frame).pack(side="left", padx=(8, 0))
+        ttk.Button(controls, text="Trim End >|", command=self.jump_to_trim_end).pack(side="left", padx=(8, 0))
+        self.scrub_value = ttk.Label(controls, text="0.00s")
+        self.scrub_value.pack(side="right")
+
+        trim_box = ttk.LabelFrame(main, text="Trim", padding=10)
+        trim_box.pack(fill="x", pady=(12, 0))
+        self.start_scale = ttk.Scale(trim_box, from_=0.0, to=0.0, variable=self.start_var, command=self.on_start_changed)
+        self.end_scale = ttk.Scale(trim_box, from_=0.0, to=0.0, variable=self.end_var, command=self.on_end_changed)
+        ttk.Label(trim_box, text="Start").grid(row=0, column=0, sticky="w")
+        self.start_value = ttk.Label(trim_box, text="0.00s")
+        self.start_value.grid(row=0, column=2, sticky="e")
+        self.start_scale.grid(row=1, column=0, columnspan=3, sticky="ew")
+        ttk.Label(trim_box, text="End").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.end_value = ttk.Label(trim_box, text="0.00s")
+        self.end_value.grid(row=2, column=2, sticky="e", pady=(10, 0))
+        self.end_scale.grid(row=3, column=0, columnspan=3, sticky="ew")
+        ttk.Button(trim_box, text="Reset To Full GIF", command=self.reset_trim).grid(row=4, column=0, sticky="w", pady=(10, 0))
+        trim_box.columnconfigure(1, weight=1)
+        trim_box.columnconfigure(2, weight=1)
+
+        opts = ttk.LabelFrame(main, text="Output Options", padding=10)
+        opts.pack(fill="x", pady=(12, 0))
+        ttk.Label(opts, textvariable=self.source_size_var).grid(row=0, column=0, columnspan=4, sticky="w")
+        ttk.Label(opts, textvariable=self.output_size_var).grid(row=0, column=4, columnspan=4, sticky="w")
+        ttk.Label(opts, text="Resize By").grid(row=1, column=0, sticky="w", pady=(10, 0))
+        resize_mode = ttk.Combobox(
+            opts,
+            textvariable=self.resize_mode_var,
+            values=("pixels", "percent"),
+            state="readonly",
+            width=10,
+        )
+        resize_mode.grid(row=1, column=1, sticky="w", padx=(6, 18), pady=(10, 0))
+        ttk.Label(opts, text="Scale %").grid(row=1, column=2, sticky="w", pady=(10, 0))
+        self.percent_scale = ttk.Scale(opts, from_=10, to=100, variable=self.resize_percent_var, command=self.on_percent_scale)
+        self.percent_scale.grid(row=1, column=3, columnspan=3, sticky="ew", pady=(10, 0))
+        self.percent_combo = ttk.Combobox(
+            opts,
+            textvariable=self.resize_percent_var,
+            values=(25, 50, 75, 100),
+            state="readonly",
+            width=8,
+        )
+        self.percent_combo.grid(row=1, column=6, sticky="w", padx=(6, 18), pady=(10, 0))
+        ttk.Label(opts, text="Width").grid(row=2, column=0, sticky="w", pady=(10, 0))
+        self.width_entry = ttk.Entry(opts, textvariable=self.width_var, width=10)
+        self.width_entry.grid(row=2, column=1, sticky="w", padx=(6, 18), pady=(10, 0))
+        ttk.Label(opts, text="Height").grid(row=2, column=2, sticky="w", pady=(10, 0))
+        self.height_entry = ttk.Entry(opts, textvariable=self.height_var, width=10)
+        self.height_entry.grid(row=2, column=3, sticky="w", padx=(6, 18), pady=(10, 0))
+        ttk.Label(opts, text="FPS").grid(row=2, column=4, sticky="w", pady=(10, 0))
+        ttk.Entry(opts, textvariable=self.fps_var, width=10).grid(row=2, column=5, sticky="w", padx=(6, 18), pady=(10, 0))
+        ttk.Label(opts, text="Loop").grid(row=2, column=6, sticky="w", pady=(10, 0))
+        ttk.Entry(opts, textvariable=self.loop_var, width=10).grid(row=2, column=7, sticky="w", padx=(6, 0), pady=(10, 0))
+        opts.columnconfigure(5, weight=1)
+
+        actions = ttk.Frame(main)
+        actions.pack(fill="x", pady=(12, 0))
+        ttk.Button(actions, text="Preview Source Externally", command=self.preview_source_external).pack(side="left")
+        ttk.Button(actions, text="Preview Output Externally", command=self.preview_output_external).pack(side="left", padx=(8, 0))
+        ttk.Button(actions, text="Render GIF", command=self.render_gif).pack(side="right")
+
+        status = ttk.Label(main, textvariable=self.status_var, relief="sunken", anchor="w")
+        status.pack(fill="x", pady=(12, 0))
+
+    def open_gif(self) -> None:
+        initial_dir = self._preferred_dialog_dir()
+        path = filedialog.askopenfilename(
+            title="Open animated GIF",
+            initialdir=initial_dir,
+            filetypes=[("GIF files", "*.gif"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        self.load_gif(Path(path))
+
+    def choose_output(self) -> None:
+        initial = self.output_path.get() or self._default_output_path()
+        initial_dir = str(Path(initial).parent) if initial else self._preferred_dialog_dir()
+        path = filedialog.asksaveasfilename(
+            title="Save output GIF",
+            defaultextension=".gif",
+            initialfile=Path(initial).name if initial else "output.gif",
+            initialdir=initial_dir,
+            filetypes=[("GIF files", "*.gif")],
+        )
+        if path:
+            self.output_path.set(path)
+
+    def _configure_file_dialog_defaults(self) -> None:
+        # On Tk file dialogs that support it, start with hidden files disabled.
+        try:
+            self.root.tk.call("set", "::tk::dialog::file::showHiddenVar", "0")
+        except tk.TclError:
+            pass
+
+    def _preferred_dialog_dir(self) -> str:
+        if self.input_path.get():
+            return str(Path(self.input_path.get()).expanduser().resolve().parent)
+        cwd = Path.cwd()
+        if cwd.exists():
+            return str(cwd)
+        return str(Path.home())
+
+    def load_gif(self, path: Path) -> None:
+        try:
+            image = Image.open(path)
+        except Exception as exc:
+            messagebox.showerror("Open failed", f"Could not open GIF.\n\n{exc}")
+            return
+
+        frames = []
+        preview_images = []
+        starts = []
+        durations = []
+        elapsed = 0.0
+
+        for frame in ImageSequence.Iterator(image):
+            rgba = frame.convert("RGBA")
+            fitted = ImageOps.contain(rgba, self.preview_size, RESAMPLE_LANCZOS)
+            background = Image.new("RGBA", self.preview_size, "#202124")
+            x = (self.preview_size[0] - fitted.width) // 2
+            y = (self.preview_size[1] - fitted.height) // 2
+            background.paste(fitted, (x, y), fitted)
+            preview_images.append(ImageTk.PhotoImage(background))
+            frames.append(rgba)
+
+            ms = frame.info.get("duration", 100)
+            if ms <= 0:
+                ms = 100
+            starts.append(elapsed)
+            durations.append(ms / 1000.0)
+            elapsed += ms / 1000.0
+
+        if not frames:
+            messagebox.showerror("Open failed", "No frames found in GIF.")
+            return
+
+        self.stop_preview()
+        self.frames = frames
+        self.preview_images = preview_images
+        self.frame_starts = starts
+        self.frame_durations = durations
+        self.total_duration = elapsed
+        self.input_path.set(str(path))
+        if not self.output_path.get():
+            self.output_path.set(self._default_output_path())
+
+        self.start_scale.configure(to=self.total_duration)
+        self.end_scale.configure(to=self.total_duration)
+        self.scrub_scale.configure(to=self.total_duration)
+        self.start_var.set(0.0)
+        self.end_var.set(self.total_duration)
+        self.current_index = 0
+        self.scrub_var.set(0.0)
+        self.is_playing = True
+        self.resize_lock = True
+        self.resize_percent_var.set(100.0)
+        self.width_var.set(str(self.frames[0].size[0]))
+        self.height_var.set(str(self.frames[0].size[1]))
+        self.resize_lock = False
+        self.update_trim_labels()
+        self.update_meta()
+        self.update_resize_labels()
+        self.apply_resize_mode()
+        self.restart_preview()
+        self.status_var.set("GIF loaded. Adjust start and end, then render.")
+
+    def _default_output_path(self) -> str:
+        if not self.input_path.get():
+            return str(Path.home() / "output.gif")
+        path = Path(self.input_path.get())
+        return str(path.with_name(f"{path.stem}-trimmed.gif"))
+
+    def update_meta(self) -> None:
+        if not self.frames:
+            self.meta_label.configure(text="No GIF loaded.")
+            self.source_size_var.set("Source: -")
+            self.output_size_var.set("Output: -")
+            return
+        width, height = self.frames[0].size
+        self.meta_label.configure(
+            text=f"{len(self.frames)} frames | {self.total_duration:.2f}s | {width}x{height}"
+        )
+        self.source_size_var.set(f"Source: {width}x{height}")
+
+    def update_resize_labels(self) -> None:
+        size = self.get_effective_output_size()
+        if size is None:
+            self.output_size_var.set("Output: -")
+            return
+        self.output_size_var.set(f"Output: {size[0]}x{size[1]}")
+
+    def get_source_size(self):
+        if not self.frames:
+            return None
+        return self.frames[0].size
+
+    def get_effective_output_size(self):
+        source = self.get_source_size()
+        if source is None:
+            return None
+        source_w, source_h = source
+        width_text = self.width_var.get().strip()
+        height_text = self.height_var.get().strip()
+        width = int(width_text) if width_text.isdigit() and int(width_text) > 0 else None
+        height = int(height_text) if height_text.isdigit() and int(height_text) > 0 else None
+        if width and height:
+            return (width, height)
+        if width:
+            return (width, max(1, round(source_h * width / source_w)))
+        if height:
+            return (max(1, round(source_w * height / source_h)), height)
+        return (source_w, source_h)
+
+    def set_dimensions(self, width: int, height: int) -> None:
+        self.resize_lock = True
+        self.width_var.set(str(width))
+        self.height_var.set(str(height))
+        self.resize_lock = False
+        self.update_resize_labels()
+
+    def apply_percent_resize(self) -> None:
+        source = self.get_source_size()
+        if source is None:
+            return
+        percent = min(100.0, max(1.0, float(self.resize_percent_var.get())))
+        source_w, source_h = source
+        width = max(1, round(source_w * percent / 100.0))
+        height = max(1, round(source_h * percent / 100.0))
+        self.resize_lock = True
+        self.resize_percent_var.set(percent)
+        self.resize_lock = False
+        self.set_dimensions(width, height)
+
+    def apply_resize_mode(self) -> None:
+        is_percent = self.resize_mode_var.get() == "percent"
+        state = "disabled" if is_percent else "normal"
+        self.width_entry.configure(state=state)
+        self.height_entry.configure(state=state)
+        self.percent_scale.configure(state="normal" if is_percent else "disabled")
+        self.percent_combo.configure(state="readonly" if is_percent else "disabled")
+        if is_percent:
+            self.apply_percent_resize()
+
+    def update_trim_labels(self) -> None:
+        start = self.start_var.get()
+        end = self.end_var.get()
+        self.start_value.configure(text=f"{start:.2f}s")
+        self.end_value.configure(text=f"{end:.2f}s")
+        self.scrub_value.configure(text=f"{self.scrub_var.get():.2f}s")
+
+    def on_start_changed(self, _value: str) -> None:
+        if self.start_var.get() > self.end_var.get():
+            self.end_var.set(self.start_var.get())
+        self.update_trim_labels()
+        self.restart_preview()
+
+    def on_end_changed(self, _value: str) -> None:
+        if self.end_var.get() < self.start_var.get():
+            self.start_var.set(self.end_var.get())
+        self.update_trim_labels()
+        self.restart_preview()
+
+    def reset_trim(self) -> None:
+        if not self.frames:
+            return
+        self.start_var.set(0.0)
+        self.end_var.set(self.total_duration)
+        self.update_trim_labels()
+        self.restart_preview()
+
+    def on_width_changed(self, *_args) -> None:
+        if self.resize_lock or self.resize_mode_var.get() != "pixels":
+            return
+        source = self.get_source_size()
+        if source is None:
+            return
+        width_text = self.width_var.get().strip()
+        if not width_text.isdigit() or int(width_text) <= 0:
+            self.update_resize_labels()
+            return
+        source_w, source_h = source
+        width = int(width_text)
+        height = max(1, round(source_h * width / source_w))
+        self.resize_lock = True
+        self.height_var.set(str(height))
+        self.resize_lock = False
+        self.resize_percent_var.set(min(100.0, width * 100.0 / source_w))
+        self.update_resize_labels()
+
+    def on_height_changed(self, *_args) -> None:
+        if self.resize_lock or self.resize_mode_var.get() != "pixels":
+            return
+        source = self.get_source_size()
+        if source is None:
+            return
+        height_text = self.height_var.get().strip()
+        if not height_text.isdigit() or int(height_text) <= 0:
+            self.update_resize_labels()
+            return
+        source_w, source_h = source
+        height = int(height_text)
+        width = max(1, round(source_w * height / source_h))
+        self.resize_lock = True
+        self.width_var.set(str(width))
+        self.resize_lock = False
+        self.resize_percent_var.set(min(100.0, height * 100.0 / source_h))
+        self.update_resize_labels()
+
+    def on_percent_scale(self, _value: str) -> None:
+        self.update_resize_labels()
+
+    def on_percent_changed(self, *_args) -> None:
+        if self.resize_lock or self.resize_mode_var.get() != "percent":
+            return
+        self.apply_percent_resize()
+
+    def on_resize_mode_changed(self, *_args) -> None:
+        self.apply_resize_mode()
+        self.update_resize_labels()
+
+    def on_scrub_changed(self, _value: str) -> None:
+        if not self.frames or self.scrub_lock:
+            return
+        self.pause_preview()
+        self.current_index = self._frame_index_for_time(self.scrub_var.get())
+        self._display_current_frame()
+
+    def stop_preview(self) -> None:
+        if self.preview_job is not None:
+            self.root.after_cancel(self.preview_job)
+            self.preview_job = None
+
+    def restart_preview(self) -> None:
+        self.stop_preview()
+        if not self.preview_images:
+            return
+        self.current_index = self._frame_index_for_time(self.start_var.get())
+        if self.is_playing:
+            self._show_preview_frame()
+        else:
+            self._display_current_frame()
+
+    def _frame_index_for_time(self, time_value: float) -> int:
+        for i, start in enumerate(self.frame_starts):
+            if start + self.frame_durations[i] > time_value:
+                return i
+        return max(0, len(self.frame_starts) - 1)
+
+    def _set_scrub_value(self, value: float) -> None:
+        self.scrub_lock = True
+        self.scrub_var.set(value)
+        self.scrub_lock = False
+        self.scrub_value.configure(text=f"{value:.2f}s")
+
+    def _display_current_frame(self) -> None:
+        if not self.preview_images:
+            self.preview_label.configure(image="")
+            return
+        self.preview_label.configure(image=self.preview_images[self.current_index])
+        self._set_scrub_value(self.frame_starts[self.current_index])
+
+    def _show_preview_frame(self) -> None:
+        if not self.preview_images:
+            self.preview_label.configure(image="")
+            return
+
+        start = self.start_var.get()
+        end = self.end_var.get()
+        if end <= start:
+            end = min(self.total_duration, start + 0.05)
+
+        frame_time = self.frame_starts[self.current_index]
+        if frame_time < start or frame_time >= end:
+            self.current_index = self._frame_index_for_time(start)
+
+        self._display_current_frame()
+
+        delay_s = max(0.02, self.frame_durations[self.current_index])
+        next_index = self.current_index + 1
+        if next_index >= len(self.preview_images):
+            next_index = self._frame_index_for_time(start)
+        elif self.frame_starts[next_index] >= end:
+            next_index = self._frame_index_for_time(start)
+
+        self.current_index = next_index
+        if self.is_playing:
+            self.preview_job = self.root.after(int(delay_s * 1000), self._show_preview_frame)
+
+    def play_preview(self) -> None:
+        if not self.frames:
+            return
+        if self.is_playing:
+            return
+        self.is_playing = True
+        self.stop_preview()
+        self._show_preview_frame()
+
+    def pause_preview(self) -> None:
+        self.is_playing = False
+        self.stop_preview()
+
+    def prev_frame(self) -> None:
+        if not self.frames:
+            return
+        self.pause_preview()
+        self.current_index = max(0, self.current_index - 1)
+        if self.frame_starts[self.current_index] < self.start_var.get():
+            self.current_index = self._frame_index_for_time(self.start_var.get())
+        self._display_current_frame()
+
+    def next_frame(self) -> None:
+        if not self.frames:
+            return
+        self.pause_preview()
+        self.current_index = min(len(self.frames) - 1, self.current_index + 1)
+        if self.frame_starts[self.current_index] >= self.end_var.get():
+            self.current_index = self._frame_index_for_time(self.start_var.get())
+        self._display_current_frame()
+
+    def jump_to_trim_start(self) -> None:
+        if not self.frames:
+            return
+        self.pause_preview()
+        self.current_index = self._frame_index_for_time(self.start_var.get())
+        self._display_current_frame()
+
+    def jump_to_trim_end(self) -> None:
+        if not self.frames:
+            return
+        self.pause_preview()
+        end_time = max(self.start_var.get(), self.end_var.get() - 0.001)
+        self.current_index = self._frame_index_for_time(end_time)
+        self._display_current_frame()
+
+    def preview_source_external(self) -> None:
+        if not self.input_path.get():
+            messagebox.showinfo("No input", "Open a GIF first.")
+            return
+        self._spawn_ffplay(Path(self.input_path.get()))
+
+    def preview_output_external(self) -> None:
+        if not self.output_path.get() or not Path(self.output_path.get()).exists():
+            messagebox.showinfo("No output", "Render an output GIF first.")
+            return
+        self._spawn_ffplay(Path(self.output_path.get()))
+
+    def _spawn_ffplay(self, path: Path) -> None:
+        try:
+            subprocess.Popen(
+                ["ffplay", "-autoexit", "-loop", "0", "-window_title", path.name, str(path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            messagebox.showerror("Preview failed", f"Could not launch ffplay.\n\n{exc}")
+
+    def render_gif(self) -> None:
+        if self.render_thread and self.render_thread.is_alive():
+            messagebox.showinfo("Render in progress", "Wait for the current render to finish.")
+            return
+        if not self.input_path.get():
+            messagebox.showinfo("No input", "Open a GIF first.")
+            return
+        if not self.output_path.get():
+            self.output_path.set(self._default_output_path())
+
+        cmd = [str(Path.home() / ".local/bin" / "giftool"), "-i", self.input_path.get(), "-o", self.output_path.get()]
+
+        start = self.start_var.get()
+        end = self.end_var.get()
+        if start > 0:
+            cmd += ["-s", f"{start:.3f}"]
+        if end < self.total_duration:
+            cmd += ["-e", f"{end:.3f}"]
+
+        if self.width_var.get().strip():
+            cmd += ["-w", self.width_var.get().strip()]
+        if self.height_var.get().strip():
+            cmd += ["-h", self.height_var.get().strip()]
+        if self.fps_var.get().strip():
+            cmd += ["-f", self.fps_var.get().strip()]
+        if self.loop_var.get().strip():
+            cmd += ["--loop", self.loop_var.get().strip()]
+
+        self.status_var.set("Rendering...")
+
+        def run() -> None:
+            try:
+                subprocess.run(cmd, check=True, capture_output=True, text=True)
+            except subprocess.CalledProcessError as exc:
+                stderr = exc.stderr.strip() or exc.stdout.strip() or "giftool failed."
+                self.root.after(0, lambda: self._render_failed(stderr))
+                return
+            self.root.after(0, self._render_complete)
+
+        self.render_thread = threading.Thread(target=run, daemon=True)
+        self.render_thread.start()
+
+    def _render_failed(self, message: str) -> None:
+        self.status_var.set("Render failed.")
+        messagebox.showerror("Render failed", message)
+
+    def _render_complete(self) -> None:
+        self.status_var.set(f"Rendered {Path(self.output_path.get()).name}")
+        messagebox.showinfo("Render complete", f"Saved to:\n\n{self.output_path.get()}")
+
+
+def main() -> None:
+    root = tk.Tk()
+    style = ttk.Style(root)
+    if "clam" in style.theme_names():
+        style.theme_use("clam")
+    app = GifToolGUI(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()

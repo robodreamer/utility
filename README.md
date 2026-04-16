@@ -7,6 +7,10 @@ Personal utility tools live in dedicated subdirectories so new tools can be adde
 - `git-park/`
   - `bin/git-park`: executable on your `PATH`
   - `README.md`: usage and shell setup
+- `giftool/`
+  - `bin/giftool`: GIF trim/resize CLI
+  - `bin/giftool-gui`: lightweight desktop UI for trimming, scrubbing, previewing, and resizing GIFs
+  - `README.md`: usage and setup
 
 ## PATH
 
@@ -14,6 +18,7 @@ Add tool bins to your shell config (Bash example):
 
 ```bash
 export PATH="$HOME/utility/git-park/bin:$PATH"
+export PATH="$HOME/utility/giftool/bin:$PATH"
 ```
 
 Then reload:
