@@ -305,7 +305,8 @@ park:
 restore:
   - Stash: apply/pop affects the worktree that contains your cwd (repo root).
     After `park`, stashes are often already applied in the linked worktree — list may be empty.
-  - Show cd: copy-pastable `cd`; list is last park, then worktrees, then history (deduped by path).
+  - Show cd: copy-pastable `cd`; active worktrees are sorted by recent use/touch,
+    then saved history is appended (deduped by path).
 
 go:
   - Prints **only** a directory path on stdout (for `cd "$(git park go)"`). Not a subprocess cd;
@@ -334,8 +335,22 @@ EOF
 cmd_status() {
   local root sf hf
   root="$(repo_root)" || die "not inside a git repository"
-  echo "=== worktrees ==="
-  git -C "$root" worktree list
+  echo "=== worktrees (recently used/touched first) ==="
+  local epoch dt path br disp label
+  while IFS=$'\t' read -r epoch dt path br disp; do
+    [[ -n "$path" ]] || continue
+    label=""
+    if [[ "$disp" == "[primary] "* ]]; then
+      label=" [primary]"
+    elif [[ "$disp" == "[last park] "* ]]; then
+      label=" [last park]"
+    fi
+    if [[ -n "$br" ]]; then
+      printf '%s  %s%s  [%s]\n' "$dt" "$path" "$label" "$br"
+    else
+      printf '%s  %s%s\n' "$dt" "$path" "$label"
+    fi
+  done < <(worktree_rows_recent)
   echo
   echo "=== stash list ==="
   git -C "$root" stash list || true
@@ -393,6 +408,22 @@ worktree_paths_porcelain() {
   git -C "$root" worktree list --porcelain 2>/dev/null | awk '/^worktree /{print substr($0,10)}'
 }
 
+branch_timestamp_record() {
+  local branch="$1" ts
+  [[ -n "$branch" ]] || return 1
+  ts="$(git reflog show --date=iso-strict --format='%ct%x09%cd' "$branch" 2>/dev/null | head -n 1 || true)"
+  if [[ -n "$ts" ]]; then
+    printf '%s\n' "$ts"
+  else
+    git log -1 --date=iso-strict --format='%ct%x09%cd' "$branch" 2>/dev/null || true
+  fi
+}
+
+commit_timestamp_record() {
+  local root="$1" ref="$2"
+  git -C "$root" log -1 --date=iso-strict --format='%ct%x09%cd' "$ref" 2>/dev/null || true
+}
+
 # Git lists the primary (original) checkout first in porcelain — same as main clone path.
 primary_worktree_path() {
   local root p
@@ -441,6 +472,85 @@ wt_append_unique() {
   [[ -n "${_wu_seen[$k]+x}" ]] && return 0
   _wu_seen[$k]=1
   _wu_opts+=("$disp")
+}
+
+worktree_display_label() {
+  local path="$1" primary="$2" last_park="$3"
+  local path_key primary_key="" last_key=""
+  path_key="$(canonical_worktree_key "$path")"
+  [[ -n "$primary" ]] && primary_key="$(canonical_worktree_key "$primary")"
+  [[ -n "$last_park" ]] && last_key="$(canonical_worktree_key "$last_park")"
+
+  if [[ -n "$primary_key" && "$path_key" == "$primary_key" ]]; then
+    printf '[primary] %s\n' "$path"
+  elif [[ -n "$last_key" && "$path_key" == "$last_key" ]]; then
+    printf '[last park] %s\n' "$path"
+  else
+    printf '%s\n' "$path"
+  fi
+}
+
+worktree_rows_recent() {
+  local root primary lastp
+  root="$(repo_root)" || return 1
+  primary="$(primary_worktree_path 2>/dev/null || true)"
+  lastp="$(last_park_worktree_path 2>/dev/null || true)"
+
+  local rows
+  rows="$(
+    local path="" branch="" head="" line ts epoch date disp
+    while IFS= read -r line; do
+      if [[ "$line" == worktree\ * ]]; then
+        if [[ -n "$path" ]]; then
+          branch="${branch#refs/heads/}"
+          if [[ -n "$branch" ]]; then
+            ts="$(branch_timestamp_record "$branch")"
+          else
+            ts="$(commit_timestamp_record "$root" "$head")"
+          fi
+          if [[ -n "$ts" ]]; then
+            IFS=$'\t' read -r epoch date <<<"$ts"
+          else
+            epoch=0
+            date="-"
+          fi
+          disp="$(worktree_display_label "$path" "$primary" "$lastp")"
+          printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$date" "$path" "$branch" "$disp"
+        fi
+        path="${line#worktree }"
+        branch=""
+        head=""
+        continue
+      fi
+      if [[ "$line" == HEAD\ * ]]; then
+        head="${line#HEAD }"
+        continue
+      fi
+      if [[ "$line" == branch\ * ]]; then
+        branch="${line#branch }"
+        continue
+      fi
+    done < <(git -C "$root" worktree list --porcelain 2>/dev/null)
+
+    if [[ -n "$path" ]]; then
+      branch="${branch#refs/heads/}"
+      if [[ -n "$branch" ]]; then
+        ts="$(branch_timestamp_record "$branch")"
+      else
+        ts="$(commit_timestamp_record "$root" "$head")"
+      fi
+      if [[ -n "$ts" ]]; then
+        IFS=$'\t' read -r epoch date <<<"$ts"
+      else
+        epoch=0
+        date="-"
+      fi
+      disp="$(worktree_display_label "$path" "$primary" "$lastp")"
+      printf '%s\t%s\t%s\t%s\t%s\n' "$epoch" "$date" "$path" "$branch" "$disp"
+    fi
+  )"
+
+  printf '%s\n' "$rows" | awk -F '\t' 'NF >= 5 { print }' | sort -rn -k1,1
 }
 
 # Display labels: "[last park] …", "[history …] …", or bare porcelain path.
@@ -723,21 +833,14 @@ history_tsv_newest_first() {
 fill_worktree_pick_options() {
   local _opts_name="$1"
   local _seen_name="$2"
-  local hf line lp dt path br int had disp pr
+  local hf line dt path br int had disp epoch
 
   hf="$(history_file)"
 
-  if pr="$(primary_worktree_path 2>/dev/null)"; then
-    wt_append_unique "$_opts_name" "$_seen_name" "[primary] $pr" "$pr"
-  fi
-
-  if lp="$(last_park_worktree_path 2>/dev/null)"; then
-    wt_append_unique "$_opts_name" "$_seen_name" "[last park] $lp" "$lp"
-  fi
-
-  while IFS= read -r line; do
-    [[ -n "$line" ]] && wt_append_unique "$_opts_name" "$_seen_name" "$line" "$line"
-  done < <(worktree_paths_porcelain 2>/dev/null || true)
+  while IFS=$'\t' read -r epoch dt path br disp; do
+    [[ -n "$path" ]] || continue
+    wt_append_unique "$_opts_name" "$_seen_name" "$disp" "$path"
+  done < <(worktree_rows_recent 2>/dev/null || true)
 
   while IFS= read -r line; do
     [[ -z "$line" ]] && continue
