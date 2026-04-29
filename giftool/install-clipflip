@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./install-clipflip [install-deps options]
+
+Installs ClipFlip as a native desktop app by running:
+  ./install-deps --app [install-deps options]
+
+Common options:
+      --system     Install apt system packages first
+      --venv DIR   Create/use a virtualenv for Python packages
+      --no-links   Do not create ~/.local/bin command links
+      --help       Show this help
+EOF
+}
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+for arg in "$@"; do
+  if [[ "$arg" == "--help" ]]; then
+    usage
+    exit 0
+  fi
+done
+
+exec "$script_dir/install-deps" --app "$@"

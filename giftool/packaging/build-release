@@ -15,6 +15,7 @@ cp -R "$project_dir/bin" "$stage_dir/bin"
 cp -R "$project_dir/packaging" "$stage_dir/packaging"
 [[ -d "$project_dir/assets" ]] && cp -R "$project_dir/assets" "$stage_dir/assets"
 cp "$project_dir/install-deps" "$stage_dir/install-deps"
+cp "$project_dir/install-clipflip" "$stage_dir/install-clipflip"
 cp "$project_dir/requirements.txt" "$stage_dir/requirements.txt"
 cp "$project_dir/README.md" "$stage_dir/README.md"
 cp "$project_dir/LICENSE" "$stage_dir/LICENSE"
@@ -22,6 +23,7 @@ cp "$project_dir/pyproject.toml" "$stage_dir/pyproject.toml"
 cp "$project_dir/setup.cfg" "$stage_dir/setup.cfg"
 
 find "$stage_dir/bin" "$stage_dir/packaging" -type f -exec chmod +x {} \;
+chmod +x "$stage_dir/install-deps" "$stage_dir/install-clipflip"
 
 tar -C "$dist_dir" -czf "$archive" "clipflip-studio-$version"
 echo "$archive"

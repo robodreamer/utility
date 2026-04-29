@@ -1,48 +1,64 @@
 # ClipFlip Studio
 
-ClipFlip Studio is a local `ffmpeg` app for trimming, converting, annotating, and comparing GIF/video clips.
+![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![ffmpeg](https://img.shields.io/badge/ffmpeg-required-007808?logo=ffmpeg&logoColor=white)
+![NiceGUI](https://img.shields.io/badge/UI-NiceGUI-2596be)
+![Linux Desktop](https://img.shields.io/badge/Desktop-Linux-333333?logo=linux&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![GitHub stars](https://img.shields.io/github/stars/robodreamer/utility?style=social)](https://github.com/robodreamer/utility/stargazers)
 
-## Contents
+ClipFlip Studio is a local `ffmpeg` workbench for trimming, converting, annotating, and comparing GIF/video clips. It keeps media on your machine, exposes the common workflows through a native desktop-style UI, and keeps scriptable CLIs for repeatable conversion jobs.
 
-- `bin/giftool`: GIF output CLI with palette generation
-- `bin/videotool`: MP4 output CLI with H.264 output, text overlays, and side-by-side comparison renders
-- `bin/converttool`: headless GIF/MP4 conversion CLI
-- `bin/giftool-ui`: NiceGUI ClipFlip Studio UI for trimming, conversion, video annotation, and before/after comparison clips
-- `bin/giftool-gui`: legacy Tk GIF-only desktop UI
-- `assets/clipflip-logo.svg`: app logo
-- `packaging/`: desktop entry and release bundle helpers
-- `install-deps`: setup helper for system checks, Python UI dependencies, and command links
+## Preview
 
-## Project Info
+| App identity | Main workflows |
+| --- | --- |
+| ![ClipFlip Studio logo](assets/clipflip.svg) | Trim GIF/video clips, convert GIF to MP4 or MP4 to GIF, add subtitle-style annotations, and render side-by-side before/after comparison videos. |
 
-- Developer: Andy Park <andypark.purdue@gmail.com>
-- Built with Codex
-- License: MIT
+## Overview
 
-## Setup
+ClipFlip is built as a small local utility rather than a hosted media service. The UI wraps the repo's `giftool`, `videotool`, and `converttool` scripts, while the desktop launcher starts the same app in a standalone native window when `pywebview` support is installed.
 
-From this directory:
+The current app supports:
+
+- GIF and video inputs, including `.gif`, `.mp4`, `.m4v`, `.mov`, and `.webm`.
+- start/end trimming with preview playback and trim-range looping.
+- GIF-to-MP4 and MP4-to-GIF conversion.
+- width, height, scale, and FPS controls.
+- subtitle-style MP4 text overlays.
+- side-by-side comparison renders with independent trim ranges and panel labels.
+- local browser mode, native window mode, and CLI-only usage.
+
+## Quick Start
+
+Install the native desktop app, command links, launcher, and icon:
 
 ```bash
-./install-deps
+./install-clipflip
 ```
 
-On a fresh apt-based Linux machine, this can also install `ffmpeg`, `pip`, `venv`, and Tk support:
+On a fresh apt-based Linux machine, include system dependencies:
 
 ```bash
-./install-deps --system
+./install-clipflip --system
 ```
 
-To keep Python packages isolated:
+Launch the app:
 
 ```bash
-./install-deps --venv .venv
+clipflip
 ```
 
-To enable the standalone native window mode:
+Use browser mode instead of the native window:
 
 ```bash
-./install-deps --native
+clipflip --browser
+```
+
+Use an isolated Python environment:
+
+```bash
+./install-clipflip --venv .venv
 ```
 
 The installer links `clipflip`, `clipflip-convert`, `giftool`, `videotool`, `converttool`, and `giftool-ui` into `~/.local/bin`. If needed, add this to your shell profile:
@@ -51,34 +67,38 @@ The installer links `clipflip`, `clipflip-convert`, `giftool`, `videotool`, `con
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
-## Modern UI
+## Install Options
 
-Launch:
+The main dependency installer remains available for narrower setups:
+
+```bash
+./install-deps
+./install-deps --system
+./install-deps --native
+./install-deps --desktop
+./install-deps --app
+```
+
+`./install-deps --app` is the single-entry native install path used by `./install-clipflip`. It installs Python UI dependencies, optional native-window support, command links, and the desktop launcher.
+
+The desktop installer writes:
+
+- `~/.local/share/applications/clipflip.desktop`
+- `~/.local/share/icons/hicolor/scalable/apps/clipflip.svg`
+
+If the launcher appears without an icon, rerun:
+
+```bash
+./install-deps --desktop
+```
+
+## Launch Modes
 
 ```bash
 clipflip
 clipflip --browser
 clipflip --native --window-size 1280x900
-```
-
-By default `clipflip` opens in a standalone pywebview window. Use `clipflip --browser` or `giftool-ui` to run the local NiceGUI browser app at `http://127.0.0.1:8080/`. It supports:
-
-- loading a GIF or video with the `Load File` picker or a typed server-side path
-- trimming with start/end sliders and numeric fields
-- tabbed source/second-video previews with nearby trim and scrub controls, playback tracking, and trim-range looping
-- cached MP4 previews for responsive GIF scrubbing and trim-range playback, with frame-preview fallback
-- proportional resizing with width/height fields and a scale slider, plus FPS conversion
-- output format selection for local GIF-to-MP4 and MP4-to-GIF conversion
-- rendering GIF output through `giftool`
-- rendering MP4 output through `videotool`
-- adding one subtitle-style text overlay to MP4 output
-- loading a second video or GIF, trimming it independently, and rendering side-by-side before/after MP4 output with optional panel labels
-- previewing muted source and rendered output in the browser, with optional `ffplay` output preview
-
-Optional desktop integration:
-
-```bash
-./packaging/install-desktop-entry
+giftool-ui --host 127.0.0.1 --port 8080
 ```
 
 Useful environment overrides:
@@ -91,7 +111,9 @@ GIFTOOL_UI_NATIVE=1 clipflip
 GIFTOOL_UI_WINDOW_SIZE=1280x900 clipflip --native
 ```
 
-## Conversion CLI
+## CLI Examples
+
+Convert between GIF and MP4:
 
 ```bash
 clipflip-convert -i input.mp4 -o output.gif -s 1 -d 3 -w 480
@@ -99,9 +121,7 @@ clipflip-convert -i input.gif -o output.mp4 --fps 30
 clipflip-convert -i input.mov -o output --format gif
 ```
 
-The converter infers `gif` or `mp4` from the output extension unless `--format` is provided.
-
-## GIF Output CLI
+Render GIF output with palette generation:
 
 ```bash
 giftool -i input.gif -o output.gif -s 1.2 -d 2.5 -w 480
@@ -109,18 +129,7 @@ giftool -i input.mp4 -o output.gif -s 1.0 -d 3.0 -w 480
 giftool -i input.gif -o output.gif -e 3.0 -h 240 -f 12
 ```
 
-Supported options:
-
-- trim by `--start`, `--end`, or `--duration`
-- resize by `--width` and/or `--height`
-- frame rate control with `--fps`
-- loop count with `--loop`
-
-The GIF CLI uses a palette generation pass to keep quality acceptable after trimming or resizing.
-
-## MP4 Output CLI
-
-Trim and resize:
+Render MP4 output:
 
 ```bash
 videotool -i input.mp4 -o output.mp4 -s 4.2 -d 8.0
@@ -128,19 +137,13 @@ videotool -i input.gif -o output.mp4 --fps 30
 videotool -i input.mp4 -o output.mp4 -e 12.0 -w 1280 --crf 22
 ```
 
-Fast keyframe-aligned copy when no filters are needed:
-
-```bash
-videotool -i input.mp4 -o clip.mp4 -s 30 -d 10 --copy
-```
-
-Add minimal subtitle-style annotation:
+Add a compact text annotation:
 
 ```bash
 videotool -i run.mp4 -o annotated.mp4 --text "model=v2, seed=42" --text-position bottom
 ```
 
-Create a before/after comparison video:
+Create a before/after comparison:
 
 ```bash
 videotool \
@@ -156,17 +159,31 @@ videotool \
   --text "experiment 17"
 ```
 
-In comparison mode, `--start`/`--duration` trim the left input and `--compare-start`/`--compare-duration` trim the right input. The side-by-side render automatically uses the shorter of the two selected ranges so both panels end together. `--width` and `--height` set the final output size; if omitted, the output defaults to `1920x1080`.
+In comparison mode, `--start` and `--duration` trim the left input, while `--compare-start` and `--compare-duration` trim the right input. The side-by-side render automatically uses the shorter selected range so both panels end together.
 
-## Legacy Tk GUI
+## Repository Layout
 
-Launch the older GIF-only GUI:
-
-```bash
-giftool-gui
+```text
+giftool/
+|-- README.md
+|-- install-clipflip
+|-- install-deps
+|-- requirements.txt
+|-- assets/
+|   `-- clipflip.svg
+|-- bin/
+|   |-- clipflip
+|   |-- clipflip-convert
+|   |-- giftool-ui
+|   |-- giftool
+|   |-- videotool
+|   |-- converttool
+|   `-- giftool-gui
+`-- packaging/
+    |-- build-release
+    |-- clipflip.desktop
+    `-- install-desktop-entry
 ```
-
-This remains useful when you only need the lightweight Tk GIF workflow.
 
 ## Packaging
 
@@ -189,8 +206,14 @@ The release keeps compatibility commands (`giftool-ui`, `giftool`, `videotool`, 
 
 - `ffmpeg` and `ffprobe`
 - optional: `ffplay` for external preview
-- Python 3
+- Python 3.10+
 - NiceGUI for the modern UI
 - optional: pywebview and WebKit/GStreamer packages for `clipflip --native`
 - Pillow for GIF metadata handling and the legacy Tk GUI
 - `tkinter` only for `giftool-gui`
+
+## Project Info
+
+- Developer: Andy Park <andypark.purdue@gmail.com>
+- Built with Codex
+- License: MIT

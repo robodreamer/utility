@@ -563,8 +563,15 @@ class TrimTool:
         with ui.column().classes("app-shell w-full gap-0"):
             with ui.element("div").classes("app-header"):
                 with ui.row().classes("items-center gap-3"):
-                    logo_path = ASSETS_DIR / "clipflip-logo.svg"
-                    if logo_path.exists():
+                    logo_path = next(
+                        (
+                            ASSETS_DIR / filename
+                            for filename in ("clipflip.svg", "clipflip-logo.svg")
+                            if (ASSETS_DIR / filename).exists()
+                        ),
+                        None,
+                    )
+                    if logo_path is not None:
                         ui.element("img").props(
                             f'src="{static_file_url(logo_path)}" alt="ClipFlip Studio"'
                         ).classes("brand-logo")

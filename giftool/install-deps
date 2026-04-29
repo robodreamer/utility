@@ -11,6 +11,8 @@ Options:
       --venv DIR   Create/use a virtualenv and install Python packages there
       --system     Install system packages with apt-get before Python packages
       --native     Install optional pywebview support for giftool-ui --native
+      --desktop    Install/update the desktop launcher and icon
+      --app        Install the native ClipFlip desktop app and launcher
       --no-links   Do not create ~/.local/bin command links
       --help       Show this help
 
@@ -19,6 +21,7 @@ Examples:
   ./install-deps --system
   ./install-deps --venv .venv
   ./install-deps --native
+  ./install-deps --system --app
 EOF
 }
 
@@ -28,6 +31,7 @@ install_mode="user"
 venv_dir=""
 install_system=""
 install_native=""
+install_desktop=""
 create_links="1"
 
 while [[ $# -gt 0 ]]; do
@@ -42,6 +46,12 @@ while [[ $# -gt 0 ]]; do
       install_system="1"; shift ;;
     --native)
       install_native="1"; shift ;;
+    --desktop)
+      install_desktop="1"; shift ;;
+    --app)
+      install_native="1"
+      install_desktop="1"
+      shift ;;
     --no-links)
       create_links=""; shift ;;
     --help)
@@ -93,12 +103,13 @@ fi
 
 if [[ "$install_mode" == "venv" ]]; then
   python3 -m venv "$venv_dir"
+  venv_root="$(cd "$venv_dir" && pwd)"
   "$venv_dir/bin/python" -m pip install --upgrade pip
   "$venv_dir/bin/python" -m pip install -r "$requirements"
   if [[ -n "$install_native" ]]; then
     "$venv_dir/bin/python" -m pip install pywebview
   fi
-  python_cmd="$venv_dir/bin/python"
+  python_cmd="$venv_root/bin/python"
 else
   python3 -m pip install --user --upgrade pip
   python3 -m pip install --user -r "$requirements"
@@ -110,12 +121,31 @@ fi
 
 if [[ -n "$create_links" ]]; then
   mkdir -p "$HOME/.local/bin"
-  ln -sf "$script_dir/bin/clipflip" "$HOME/.local/bin/clipflip"
-  ln -sf "$script_dir/bin/clipflip-convert" "$HOME/.local/bin/clipflip-convert"
-  ln -sf "$script_dir/bin/giftool" "$HOME/.local/bin/giftool"
-  ln -sf "$script_dir/bin/videotool" "$HOME/.local/bin/videotool"
-  ln -sf "$script_dir/bin/converttool" "$HOME/.local/bin/converttool"
-  ln -sf "$script_dir/bin/giftool-ui" "$HOME/.local/bin/giftool-ui"
+  commands=(clipflip clipflip-convert giftool videotool converttool giftool-ui)
+  if [[ "$install_mode" == "venv" ]]; then
+    for command_name in "${commands[@]}"; do
+      wrapper="$HOME/.local/bin/$command_name"
+      cat > "$wrapper" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export PATH="$venv_root/bin:\$PATH"
+exec "$script_dir/bin/$command_name" "\$@"
+EOF
+      chmod +x "$wrapper"
+    done
+  else
+    for command_name in "${commands[@]}"; do
+      ln -sf "$script_dir/bin/$command_name" "$HOME/.local/bin/$command_name"
+    done
+  fi
+fi
+
+if [[ -n "$install_desktop" ]]; then
+  launcher="$script_dir/bin/clipflip"
+  if [[ -n "$create_links" ]]; then
+    launcher="$HOME/.local/bin/clipflip"
+  fi
+  "$script_dir/packaging/install-desktop-entry" --exec "$launcher"
 fi
 
 cat <<EOF
