@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_dir="$(cd "$script_dir/.." && pwd)"
+apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+icons_dir="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+
+mkdir -p "$apps_dir" "$icons_dir"
+cp "$project_dir/packaging/clipflip.desktop" "$apps_dir/clipflip.desktop"
+cp "$project_dir/assets/clipflip-logo.svg" "$icons_dir/clipflip.svg"
+
+echo "Installed ClipFlip Studio desktop entry."
