@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ClipFlip Studio
+Comment=Trim, convert, annotate, and compare GIF/video clips locally
+Exec=clipflip
+Icon=clipflip
+Terminal=false
+Categories=AudioVideo;Video;Graphics;
+Keywords=gif;mp4;video;trim;convert;ffmpeg;

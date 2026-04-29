@@ -10,6 +10,7 @@ Options:
       --user       Install Python packages with pip --user (default)
       --venv DIR   Create/use a virtualenv and install Python packages there
       --system     Install system packages with apt-get before Python packages
+      --native     Install optional pywebview support for giftool-ui --native
       --no-links   Do not create ~/.local/bin command links
       --help       Show this help
 
@@ -17,6 +18,7 @@ Examples:
   ./install-deps
   ./install-deps --system
   ./install-deps --venv .venv
+  ./install-deps --native
 EOF
 }
 
@@ -25,6 +27,7 @@ requirements="$script_dir/requirements.txt"
 install_mode="user"
 venv_dir=""
 install_system=""
+install_native=""
 create_links="1"
 
 while [[ $# -gt 0 ]]; do
@@ -37,6 +40,8 @@ while [[ $# -gt 0 ]]; do
       shift 2 ;;
     --system)
       install_system="1"; shift ;;
+    --native)
+      install_native="1"; shift ;;
     --no-links)
       create_links=""; shift ;;
     --help)
@@ -59,7 +64,16 @@ if [[ -n "$install_system" ]]; then
     exit 1
   fi
   sudo apt-get update
-  sudo apt-get install -y ffmpeg python3-pip python3-venv python3-tk
+  system_packages=(ffmpeg python3-pip python3-venv python3-tk)
+  if [[ -n "$install_native" ]]; then
+    system_packages+=(python3-gi python3-gi-cairo gir1.2-gtk-3.0 gstreamer1.0-plugins-bad)
+    if apt-cache show gir1.2-webkit2-4.1 >/dev/null 2>&1; then
+      system_packages+=(gir1.2-webkit2-4.1)
+    elif apt-cache show gir1.2-webkit2-4.0 >/dev/null 2>&1; then
+      system_packages+=(gir1.2-webkit2-4.0)
+    fi
+  fi
+  sudo apt-get install -y "${system_packages[@]}"
 fi
 
 if ! command -v ffmpeg >/dev/null 2>&1; then
@@ -81,31 +95,42 @@ if [[ "$install_mode" == "venv" ]]; then
   python3 -m venv "$venv_dir"
   "$venv_dir/bin/python" -m pip install --upgrade pip
   "$venv_dir/bin/python" -m pip install -r "$requirements"
+  if [[ -n "$install_native" ]]; then
+    "$venv_dir/bin/python" -m pip install pywebview
+  fi
   python_cmd="$venv_dir/bin/python"
 else
   python3 -m pip install --user --upgrade pip
   python3 -m pip install --user -r "$requirements"
+  if [[ -n "$install_native" ]]; then
+    python3 -m pip install --user pywebview
+  fi
   python_cmd="python3"
 fi
 
 if [[ -n "$create_links" ]]; then
   mkdir -p "$HOME/.local/bin"
+  ln -sf "$script_dir/bin/clipflip" "$HOME/.local/bin/clipflip"
+  ln -sf "$script_dir/bin/clipflip-convert" "$HOME/.local/bin/clipflip-convert"
   ln -sf "$script_dir/bin/giftool" "$HOME/.local/bin/giftool"
   ln -sf "$script_dir/bin/videotool" "$HOME/.local/bin/videotool"
+  ln -sf "$script_dir/bin/converttool" "$HOME/.local/bin/converttool"
   ln -sf "$script_dir/bin/giftool-ui" "$HOME/.local/bin/giftool-ui"
 fi
 
 cat <<EOF
 Dependencies installed.
 
-Run the modern UI with:
-  giftool-ui
+Run ClipFlip Studio with:
+  clipflip
+  clipflip --browser
 
 Run the CLIs with:
   giftool --help
   videotool --help
+  clipflip-convert --help
 
-If giftool-ui is not found, add this to your shell profile:
+If clipflip is not found, add this to your shell profile:
   export PATH="\$HOME/.local/bin:\$PATH"
 
 Python used for dependency checks:

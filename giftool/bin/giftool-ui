@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import argparse
+import bisect
 import json
 import os
 import re
@@ -15,11 +17,11 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from nicegui import events, ui
+    from nicegui import app, events, ui
 except ModuleNotFoundError as exc:
     missing = exc.name or "nicegui"
     print(
-        f"{missing} is required for giftool-ui.\n"
+        f"{missing} is required for ClipFlip Studio.\n"
         "Install the UI dependencies with:\n"
         "  python3 -m pip install --user -r "
         f"{Path(__file__).resolve().parents[1] / 'requirements.txt'}",
@@ -29,13 +31,57 @@ except ModuleNotFoundError as exc:
 
 
 SCRIPT_DIR = Path(__file__).resolve().parent
+ASSETS_DIR = SCRIPT_DIR.parent / "assets"
 CACHE_DIR = Path(os.environ.get("GIFTOOL_UI_CACHE", str(Path.home() / ".cache" / "giftool-ui"))).expanduser()
 UPLOAD_DIR = CACHE_DIR / "uploads"
 OUTPUT_DIR = CACHE_DIR / "outputs"
+FRAME_DIR = CACHE_DIR / "frames"
+PREVIEW_DIR = CACHE_DIR / "previews"
 
 VIDEO_SUFFIXES = {".mp4", ".m4v", ".mov", ".webm"}
 GIF_SUFFIXES = {".gif"}
 ACCEPTED_SUFFIXES = VIDEO_SUFFIXES | GIF_SUFFIXES
+GIF_PREVIEW_MAX_FPS = 24.0
+GIF_PREVIEW_MAX_FRAMES = 600
+GIF_PLAYBACK_UI_FPS = 12.0
+STATIC_FILE_URLS: dict[Path, str] = {}
+
+
+def env_flag(name: str, default: bool = False) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    return raw_value.lower() not in {"0", "false", "no", "off"}
+
+
+def parse_window_size(value: str | None) -> tuple[int, int] | None:
+    if not value:
+        return None
+    match = re.fullmatch(r"(\d+)x(\d+)", value.strip().lower())
+    if not match:
+        raise argparse.ArgumentTypeError("Use WIDTHxHEIGHT, for example 1280x900.")
+    width, height = (int(match.group(1)), int(match.group(2)))
+    if width <= 0 or height <= 0:
+        raise argparse.ArgumentTypeError("Window dimensions must be positive.")
+    return width, height
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    env_port = os.environ.get("GIFTOOL_UI_PORT")
+    parser = argparse.ArgumentParser(description="Launch the ClipFlip Studio UI.")
+    parser.add_argument("--host", default=os.environ.get("GIFTOOL_UI_HOST", "127.0.0.1"))
+    parser.add_argument("--port", type=int, default=int(env_port) if env_port else None)
+    parser.add_argument("--no-show", action="store_true", default=not env_flag("GIFTOOL_UI_SHOW", True))
+    parser.add_argument("--native", action="store_true", default=env_flag("GIFTOOL_UI_NATIVE", False))
+    parser.add_argument(
+        "--window-size",
+        type=parse_window_size,
+        default=parse_window_size(os.environ.get("GIFTOOL_UI_WINDOW_SIZE")),
+        metavar="WIDTHxHEIGHT",
+    )
+    parser.add_argument("--fullscreen", action="store_true", default=env_flag("GIFTOOL_UI_FULLSCREEN", False))
+    parser.add_argument("--frameless", action="store_true", default=env_flag("GIFTOOL_UI_FRAMELESS", False))
+    return parser.parse_args(argv)
 
 
 @dataclass
@@ -48,6 +94,21 @@ class MediaInfo:
     codec: str
     fps: float | None
     frame_count: str | None
+
+
+@dataclass
+class GifPreviewFile:
+    start: float
+    end: float
+    path: Path
+
+
+@dataclass
+class GifPreviewFrame:
+    start: float
+    end: float
+    path: Path
+    url: str
 
 
 def clean_filename(name: str) -> str:
@@ -144,14 +205,101 @@ def probe_gif_duration(path: Path) -> float:
     return total_ms / 1000.0
 
 
+def extract_gif_preview_files(path: Path, total_duration: float = 0.0) -> list[GifPreviewFile]:
+    try:
+        from PIL import Image, ImageSequence
+    except ModuleNotFoundError as exc:
+        raise RuntimeError("Pillow is required for GIF frame preview.") from exc
+
+    path = path.expanduser()
+    FRAME_DIR.mkdir(parents=True, exist_ok=True)
+    min_interval = 1.0 / GIF_PREVIEW_MAX_FPS
+    if total_duration > 0:
+        min_interval = max(min_interval, total_duration / GIF_PREVIEW_MAX_FRAMES)
+
+    preview_files: list[GifPreviewFile] = []
+    elapsed = 0.0
+    last_saved_at = -min_interval
+    mtime_ns = path.stat().st_mtime_ns
+    safe_stem = clean_filename(path.stem)
+
+    with Image.open(path) as image:
+        for index, frame in enumerate(ImageSequence.Iterator(image)):
+            duration = max(10, int(frame.info.get("duration", 100))) / 1000.0
+            frame_start = elapsed
+            frame_end = frame_start + duration
+            should_save = not preview_files or frame_start - last_saved_at >= min_interval
+
+            if should_save:
+                target = FRAME_DIR / f"{safe_stem}-{mtime_ns}-{index}.png"
+                if not target.exists():
+                    frame.copy().convert("RGBA").save(target)
+                preview_files.append(GifPreviewFile(frame_start, frame_end, target))
+                last_saved_at = frame_start
+            elif preview_files:
+                preview_files[-1].end = frame_end
+
+            elapsed = frame_end
+
+    if not preview_files:
+        raise RuntimeError("Could not read GIF frames.")
+    return preview_files
+
+
+def gif_video_preview_path(path: Path) -> Path:
+    path = path.expanduser()
+    return PREVIEW_DIR / f"{clean_filename(path.stem)}-{path.stat().st_mtime_ns}.mp4"
+
+
+def ensure_gif_video_preview(path: Path) -> Path:
+    target = gif_video_preview_path(path)
+    if target.exists() and target.stat().st_size > 0:
+        return target
+
+    PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+    temp_target = target.with_suffix(".tmp.mp4")
+    cmd = [
+        "ffmpeg",
+        "-y",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-i",
+        str(path.expanduser()),
+        "-an",
+        "-vf",
+        "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+        "-pix_fmt",
+        "yuv420p",
+        "-movflags",
+        "+faststart",
+        str(temp_target),
+    ]
+    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    temp_target.replace(target)
+    return target
+
+
 def shell_join(cmd: list[str]) -> str:
     return " ".join(shlex.quote(part) for part in cmd)
+
+
+def static_file_url(path: Path) -> str:
+    resolved = path.resolve()
+    if resolved not in STATIC_FILE_URLS:
+        STATIC_FILE_URLS[resolved] = app.add_static_file(local_file=resolved)
+    try:
+        return f"{STATIC_FILE_URLS[resolved]}?v={resolved.stat().st_mtime_ns}"
+    except OSError:
+        return STATIC_FILE_URLS[resolved]
 
 
 class TrimTool:
     def __init__(self) -> None:
         UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
         OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        FRAME_DIR.mkdir(parents=True, exist_ok=True)
+        PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
 
         self.info: MediaInfo | None = None
         self.compare_info: MediaInfo | None = None
@@ -163,8 +311,16 @@ class TrimTool:
         self.compare_start_time = 0.0
         self.compare_end_time = 0.0
         self.compare_scrub_time = 0.0
+        self.output_format = "auto"
         self.rendering = False
         self.syncing = False
+        self.resize_syncing = False
+        self.gif_play_task: asyncio.Task | None = None
+        self.gif_video_preview_path: Path | None = None
+        self.compare_video_preview_path: Path | None = None
+        self.gif_preview_path: Path | None = None
+        self.gif_preview_frames: list[GifPreviewFrame] = []
+        self.gif_preview_frame_starts: list[float] = []
         self.source_trim_event_guard_until = 0.0
         self.compare_trim_event_guard_until = 0.0
         self.pending_scrub_updates: list[tuple[float, float]] = []
@@ -186,6 +342,7 @@ class TrimTool:
         self.download_button = None
         self.source_video = None
         self.compare_video = None
+        self.gif_frame_image = None
         self.start_slider = None
         self.end_slider = None
         self.scrub_slider = None
@@ -201,6 +358,10 @@ class TrimTool:
         self.compare_scrub_input = None
         self.width_input = None
         self.height_input = None
+        self.resize_scale_slider = None
+        self.resize_scale_input = None
+        self.output_size_label = None
+        self.output_format_select = None
         self.fps_input = None
         self.loop_input = None
         self.crf_slider = None
@@ -214,7 +375,7 @@ class TrimTool:
         self.label_right_input = None
 
     def build(self) -> None:
-        ui.page_title("GIF/MP4 Trim Tool")
+        ui.page_title("ClipFlip Studio")
         ui.colors(primary="#2563eb", secondary="#0f766e", accent="#d97706")
         ui.add_head_html(
             """
@@ -312,6 +473,11 @@ class TrimTool:
                 place-items: center;
                 font-weight: 700;
               }
+              .brand-logo {
+                width: 40px;
+                height: 40px;
+                border-radius: 10px;
+              }
               .tool-grid {
                 display: grid;
                 grid-template-columns: minmax(280px, 360px) minmax(380px, 1fr) minmax(300px, 390px);
@@ -351,18 +517,16 @@ class TrimTool:
                 object-fit: contain;
                 background: #111827;
               }
-              .compare-preview {
-                display: grid;
-                grid-template-columns: 1fr 1fr;
-                gap: 10px;
+              .preview-tab-panel {
+                padding: 0;
+              }
+              .preview-tab-content {
                 width: 100%;
               }
-              .compare-preview video {
+              .trim-controls {
                 width: 100%;
-                max-height: 420px;
-                object-fit: contain;
-                background: #111827;
-                border-radius: 6px;
+                border-top: 1px solid #dbe2ec;
+                padding-top: 12px;
               }
               .empty-preview {
                 color: #cbd5e1;
@@ -391,9 +555,6 @@ class TrimTool:
                 .preview-surface {
                   min-height: 300px;
                 }
-                .compare-preview {
-                  grid-template-columns: 1fr;
-                }
               }
             </style>
             """
@@ -402,10 +563,16 @@ class TrimTool:
         with ui.column().classes("app-shell w-full gap-0"):
             with ui.element("div").classes("app-header"):
                 with ui.row().classes("items-center gap-3"):
-                    ui.label("G").classes("brand-mark")
+                    logo_path = ASSETS_DIR / "clipflip-logo.svg"
+                    if logo_path.exists():
+                        ui.element("img").props(
+                            f'src="{static_file_url(logo_path)}" alt="ClipFlip Studio"'
+                        ).classes("brand-logo")
+                    else:
+                        ui.label("CF").classes("brand-mark")
                     with ui.column().classes("gap-0"):
-                        ui.label("GIF/MP4 Trim Tool").classes("text-h5 text-weight-bold")
-                        ui.label("Local ffmpeg trimming with a browser UI").classes("muted")
+                        ui.label("ClipFlip Studio").classes("text-h5 text-weight-bold")
+                        ui.label("Local ffmpeg trimming, conversion, annotation, and comparison").classes("muted")
                 ui.button("Render", icon="content_cut", on_click=self.render).props("unelevated").classes("px-5")
 
             with ui.element("div").classes("tool-grid"):
@@ -435,9 +602,11 @@ class TrimTool:
             ui.separator()
             ui.label("Comparison").classes("section-title")
             self.compare_upload = ui.upload(on_upload=self.handle_compare_upload, auto_upload=True).props(
-                'accept=".mp4,.m4v,.mov,.webm,video/*"'
+                'accept=".gif,.mp4,.m4v,.mov,.webm,video/*,image/gif"'
             ).classes("hidden")
-            self.compare_path_input = ui.input("Second video path").props("outlined dense clearable").classes("w-full")
+            self.compare_path_input = ui.input("Second media path").props("outlined dense clearable").classes(
+                "w-full"
+            )
             with ui.row().classes("w-full gap-2"):
                 ui.button("Load Second", icon="video_library").props("outline").classes("grow").on(
                     "click",
@@ -465,57 +634,13 @@ class TrimTool:
     def preview_panel(self) -> None:
         self.source_video = None
         self.compare_video = None
-        with ui.column().classes("panel gap-4"):
-            with ui.row().classes("items-center justify-between w-full"):
-                ui.label("Preview").classes("section-title")
-                if self.info is not None:
-                    ui.label(self.info.path.name).classes("muted")
-
-            with ui.element("div").classes("preview-surface"):
-                if self.info is None:
-                    with ui.column().classes("empty-preview items-center gap-2"):
-                        ui.icon("movie").classes("text-5xl")
-                        ui.label("No media loaded")
-                elif self.info.kind == "gif":
-                    ui.image(self.info.path).classes("media-view")
-                elif self.compare_info:
-                    with ui.element("div").classes("compare-preview"):
-                        self.source_video = ui.video(self.info.path).props("controls preload=metadata muted")
-                        self.source_video.on(
-                            "timeupdate",
-                            self.on_preview_time_update,
-                            js_handler="(event) => emit(event.target.currentTime)",
-                            throttle=0.1,
-                        )
-                        self.compare_video = ui.video(self.compare_info.path).props("controls preload=metadata muted")
-                        self.compare_video.on(
-                            "timeupdate",
-                            self.on_compare_time_update,
-                            js_handler="(event) => emit(event.target.currentTime)",
-                            throttle=0.1,
-                        )
-                else:
-                    self.source_video = ui.video(self.info.path).props("controls preload=metadata muted").classes(
-                        "media-view"
-                    )
-                    self.source_video.on(
-                        "timeupdate",
-                        self.on_preview_time_update,
-                        js_handler="(event) => emit(event.target.currentTime)",
-                        throttle=0.1,
-                    )
-
-            if self.output_path:
-                ui.label("Rendered Output").classes("section-title")
-                with ui.element("div").classes("preview-surface"):
-                    if self.output_path.suffix.lower() == ".gif":
-                        ui.image(self.output_path).classes("media-view")
-                    else:
-                        ui.video(self.output_path).props("controls preload=metadata muted").classes("media-view")
-
-    @ui.refreshable
-    def controls_panel(self) -> None:
+        self.gif_frame_image = None
+        self.trim_label = None
+        self.start_slider = None
+        self.end_slider = None
         self.scrub_slider = None
+        self.start_input = None
+        self.end_input = None
         self.scrub_input = None
         self.compare_trim_label = None
         self.compare_start_slider = None
@@ -524,20 +649,133 @@ class TrimTool:
         self.compare_start_input = None
         self.compare_end_input = None
         self.compare_scrub_input = None
+        with ui.column().classes("panel gap-4"):
+            with ui.row().classes("items-center justify-between w-full"):
+                ui.label("Preview").classes("section-title")
+                if self.info is not None:
+                    ui.label(self.info.path.name).classes("muted")
+
+            if self.info is None:
+                with ui.element("div").classes("preview-surface"):
+                    with ui.column().classes("empty-preview items-center gap-2"):
+                        ui.icon("movie").classes("text-5xl")
+                        ui.label("No media loaded")
+            elif self.compare_info is not None:
+                with ui.tabs().classes("w-full") as tabs:
+                    source_tab = ui.tab("Source")
+                    compare_tab = ui.tab("Second")
+                with ui.tab_panels(tabs, value=source_tab).classes("w-full").props("animated"):
+                    with ui.tab_panel(source_tab).classes("preview-tab-panel"):
+                        self.source_preview_tab()
+                    with ui.tab_panel(compare_tab).classes("preview-tab-panel"):
+                        self.compare_preview_tab()
+            else:
+                self.source_preview_tab()
+
+            if self.output_path:
+                ui.label("Rendered Output").classes("section-title")
+                with ui.element("div").classes("preview-surface"):
+                    if self.output_path.suffix.lower() == ".gif":
+                        self.gif_preview(self.output_path)
+                    else:
+                        ui.video(self.output_path).props("controls preload=metadata muted").classes("media-view")
+
+    def gif_preview(self, path: Path) -> None:
+        ui.element("img").props(f'src="{static_file_url(path)}"').classes("media-view")
+
+    async def prepare_gif_preview(self, info: MediaInfo) -> None:
+        self.gif_preview_path = None
+        self.gif_preview_frames = []
+        self.gif_preview_frame_starts = []
+        preview_files = extract_gif_preview_files(info.path, info.duration)
+        self.gif_preview_frames = [
+            GifPreviewFrame(item.start, item.end, item.path, static_file_url(item.path)) for item in preview_files
+        ]
+        self.gif_preview_frame_starts = [item.start for item in self.gif_preview_frames]
+        self.gif_preview_path = info.path
+
+    def gif_frame_for_time(self, timestamp: float) -> GifPreviewFrame | None:
+        if not self.gif_preview_frames:
+            return None
+        index = bisect.bisect_right(self.gif_preview_frame_starts, max(0.0, timestamp)) - 1
+        index = max(0, min(index, len(self.gif_preview_frames) - 1))
+        return self.gif_preview_frames[index]
+
+    def gif_frame_preview(self) -> None:
+        if self.info is None:
+            return
+        frame = self.gif_frame_for_time(self.scrub_time)
+        if frame is None:
+            ui.label("GIF preview unavailable").classes("empty-preview")
+            return
+        self.gif_frame_image = (
+            ui.element("img").props(f'src="{frame.url}" loading=eager decoding=async').classes("media-view")
+        )
+
+    def update_gif_frame_preview(self) -> None:
+        if self.info is None or self.info.kind != "gif" or self.gif_frame_image is None:
+            return
+        frame = self.gif_frame_for_time(self.scrub_time)
+        if frame is None:
+            return
+        if self.gif_frame_image.props.get("src") == frame.url:
+            return
+        self.gif_frame_image.props["src"] = frame.url
+        self.gif_frame_image.update()
+
+    def source_preview_tab(self) -> None:
+        with ui.column().classes("preview-tab-content gap-4"):
+            with ui.element("div").classes("preview-surface"):
+                if self.info is None:
+                    return
+                if self.info.kind == "gif" and self.gif_video_preview_path is None:
+                    self.gif_frame_preview()
+                else:
+                    source_path = self.gif_video_preview_path if self.info.kind == "gif" else self.info.path
+                    self.source_video = ui.video(source_path).props("controls preload=metadata muted").classes(
+                        "media-view"
+                    )
+                    self.source_video.on(
+                        "timeupdate",
+                        self.on_preview_time_update,
+                        js_handler="(event) => emit(event.target.currentTime)",
+                        throttle=0.1,
+                    )
+            self.source_trim_controls()
+
+    def compare_preview_tab(self) -> None:
+        if self.compare_info is None:
+            return
+        with ui.column().classes("preview-tab-content gap-4"):
+            with ui.element("div").classes("preview-surface"):
+                compare_path = (
+                    self.compare_video_preview_path
+                    if self.compare_info.kind == "gif" and self.compare_video_preview_path is not None
+                    else self.compare_info.path
+                )
+                if self.compare_info.kind == "gif" and self.compare_video_preview_path is None:
+                    self.gif_preview(self.compare_info.path)
+                else:
+                    self.compare_video = ui.video(compare_path).props("controls preload=metadata muted").classes(
+                        "media-view"
+                    )
+                    self.compare_video.on(
+                        "timeupdate",
+                        self.on_compare_time_update,
+                        js_handler="(event) => emit(event.target.currentTime)",
+                        throttle=0.1,
+                    )
+            self.compare_trim_controls()
+
+    def source_trim_controls(self) -> None:
         duration = max(0.01, self.info.duration if self.info else 1.0)
         start = min(self.start_time, duration)
         end = self.end_time if self.end_time > 0 else duration
         end = min(max(start, end), duration)
         scrub_min, scrub_max = self.scrub_bounds()
         scrub = min(max(self.scrub_time, scrub_min), scrub_max)
-        compare_duration = max(0.01, self.compare_info.duration if self.compare_info else 1.0)
-        compare_start = min(self.compare_start_time, compare_duration)
-        compare_end = self.compare_end_time if self.compare_end_time > 0 else compare_duration
-        compare_end = min(max(compare_start, compare_end), compare_duration)
-        compare_scrub_min, compare_scrub_max = self.compare_scrub_bounds()
-        compare_scrub = min(max(self.compare_scrub_time, compare_scrub_min), compare_scrub_max)
 
-        with ui.column().classes("panel gap-4"):
+        with ui.column().classes("trim-controls gap-3"):
             ui.label("Trim").classes("section-title")
             self.trim_label = ui.label(self.trim_text()).classes("muted")
             self.start_slider = ui.slider(
@@ -571,8 +809,10 @@ class TrimTool:
                 ).props("outlined dense suffix=s").classes("grow")
             with ui.row().classes("w-full gap-2"):
                 ui.button("Full Range", icon="select_all", on_click=self.full_range).props("outline").classes("grow")
-                ui.button("Set 5s Clip", icon="timer", on_click=self.set_five_second_clip).props("outline").classes("grow")
-            if self.info is not None and self.info.kind == "video":
+                ui.button("Set 5s Clip", icon="timer", on_click=self.set_five_second_clip).props("outline").classes(
+                    "grow"
+                )
+            if self.info is not None:
                 ui.label("Preview Position").classes("section-title")
                 self.scrub_slider = ui.slider(
                     min=scrub_min,
@@ -589,24 +829,186 @@ class TrimTool:
                     step=0.1,
                     on_change=lambda e: self.set_scrub(e.value),
                 ).props("outlined dense suffix=s").classes("w-full")
+            if self.info is not None and self.info.kind == "video":
                 with ui.row().classes("w-full gap-2"):
                     ui.button("Play Once", icon="play_arrow", on_click=self.play_trim_range).props(
                         "unelevated"
                     ).classes("grow")
-                    ui.button("Loop Range", icon="repeat", on_click=self.loop_trim_range).props("outline").classes("grow")
-                    ui.button("Pause", icon="pause", on_click=self.pause_trim_preview).props("outline").classes("grow")
+                    ui.button("Loop Range", icon="repeat", on_click=self.loop_trim_range).props("outline").classes(
+                        "grow"
+                    )
+                    ui.button("Pause", icon="pause", on_click=self.pause_trim_preview).props("outline").classes(
+                        "grow"
+                    )
+            elif self.info is not None and self.info.kind == "gif":
+                with ui.row().classes("w-full gap-2"):
+                    ui.button("Play Once", icon="play_arrow", on_click=self.play_gif_range).props(
+                        "unelevated"
+                    ).classes("grow")
+                    ui.button("Loop Range", icon="repeat", on_click=self.loop_gif_range).props("outline").classes(
+                        "grow"
+                    )
+                    ui.button("Pause", icon="pause", on_click=self.pause_gif_preview).props("outline").classes(
+                        "grow"
+                    )
 
-            ui.separator()
+    def compare_trim_controls(self) -> None:
+        compare_duration = max(0.01, self.compare_info.duration if self.compare_info else 1.0)
+        compare_start = min(self.compare_start_time, compare_duration)
+        compare_end = self.compare_end_time if self.compare_end_time > 0 else compare_duration
+        compare_end = min(max(compare_start, compare_end), compare_duration)
+        compare_scrub_min, compare_scrub_max = self.compare_scrub_bounds()
+        compare_scrub = min(max(self.compare_scrub_time, compare_scrub_min), compare_scrub_max)
+
+        with ui.column().classes("trim-controls gap-3"):
+            ui.label("Second Trim").classes("section-title")
+            self.compare_trim_label = ui.label(self.compare_trim_text()).classes("muted")
+            self.compare_start_slider = ui.slider(
+                min=0.0,
+                max=compare_duration,
+                value=compare_start,
+                step=0.01,
+                on_change=lambda e: self.set_compare_start(e.value),
+            ).props("label-always")
+            self.compare_end_slider = ui.slider(
+                min=0.0,
+                max=compare_duration,
+                value=compare_end,
+                step=0.01,
+                on_change=lambda e: self.set_compare_end(e.value),
+            ).props("label-always")
+            with ui.row().classes("w-full gap-2"):
+                self.compare_start_input = ui.number(
+                    "Start",
+                    value=round(compare_start, 3),
+                    min=0.0,
+                    step=0.1,
+                    on_change=lambda e: self.set_compare_start(e.value),
+                ).props("outlined dense suffix=s").classes("grow")
+                self.compare_end_input = ui.number(
+                    "End",
+                    value=round(compare_end, 3),
+                    min=0.0,
+                    step=0.1,
+                    on_change=lambda e: self.set_compare_end(e.value),
+                ).props("outlined dense suffix=s").classes("grow")
+            with ui.row().classes("w-full gap-2"):
+                ui.button("Full Range", icon="select_all", on_click=self.full_compare_range).props("outline").classes(
+                    "grow"
+                )
+                ui.button("Set 5s Clip", icon="timer", on_click=self.set_compare_five_second_clip).props(
+                    "outline"
+                ).classes("grow")
+            ui.label("Second Preview Position").classes("section-title")
+            self.compare_scrub_slider = ui.slider(
+                min=compare_scrub_min,
+                max=compare_scrub_max,
+                value=compare_scrub,
+                step=0.01,
+                on_change=lambda e: self.set_compare_scrub(e.value),
+            ).props("label-always")
+            self.compare_scrub_input = ui.number(
+                "Scrub",
+                value=round(compare_scrub, 3),
+                min=compare_scrub_min,
+                max=compare_scrub_max,
+                step=0.1,
+                on_change=lambda e: self.set_compare_scrub(e.value),
+            ).props("outlined dense suffix=s").classes("w-full")
+            with ui.row().classes("w-full gap-2"):
+                ui.button("Play Second", icon="play_arrow", on_click=self.play_compare_trim_range).props(
+                    "unelevated"
+                ).classes("grow")
+                ui.button("Loop Second", icon="repeat", on_click=self.loop_compare_trim_range).props(
+                    "outline"
+                ).classes("grow")
+                ui.button("Pause Second", icon="pause", on_click=self.pause_compare_trim_preview).props(
+                    "outline"
+                ).classes("grow")
+
+    @ui.refreshable
+    def controls_panel(self) -> None:
+        self.output_format_select = None
+        self.loop_input = None
+        self.caption_input = None
+        self.text_position_select = None
+        self.text_size_input = None
+        self.side_by_side_checkbox = None
+        self.label_left_input = None
+        self.label_right_input = None
+        self.crf_slider = None
+        self.preset_select = None
+        self.copy_checkbox = None
+
+        with ui.column().classes("panel gap-4"):
             ui.label("Output").classes("section-title")
             with ui.row().classes("w-full gap-2"):
-                self.width_input = ui.input("Width").props("outlined dense").classes("grow")
-                self.height_input = ui.input("Height").props("outlined dense").classes("grow")
+                self.width_input = ui.number(
+                    "Width",
+                    min=1,
+                    step=2,
+                    on_change=lambda e: self.set_output_width(e.value),
+                ).props("outlined dense suffix=px").classes("grow")
+                self.height_input = ui.number(
+                    "Height",
+                    min=1,
+                    step=2,
+                    on_change=lambda e: self.set_output_height(e.value),
+                ).props("outlined dense suffix=px").classes("grow")
+            ui.label("Scale").classes("muted")
+            with ui.row().classes("w-full gap-2 items-center"):
+                self.resize_scale_slider = ui.slider(
+                    min=10,
+                    max=100,
+                    value=100,
+                    step=5,
+                    on_change=lambda e: self.set_output_scale(e.value),
+                ).props("label-always").classes("grow")
+                self.resize_scale_input = ui.number(
+                    "Scale",
+                    value=100,
+                    min=10,
+                    max=100,
+                    step=5,
+                    on_change=lambda e: self.set_output_scale(e.value),
+                ).props("outlined dense suffix=%").classes("w-24")
+            self.output_size_label = ui.label("Output: -").classes("muted")
+            if self.info is not None:
+                self.output_format_select = ui.select(
+                    {"auto": "Auto", "gif": "GIF", "mp4": "MP4"},
+                    value=self.output_format_select_value(),
+                    label="Output format",
+                    on_change=lambda e: self.set_output_format(e.value),
+                ).props("outlined dense").classes("w-full")
+                if self.side_by_side_active():
+                    self.output_format_select.disable()
             self.fps_input = ui.input("FPS").props("outlined dense").classes("w-full")
 
-            if self.info is None or self.info.kind == "gif":
+            compare_ready = self.info is not None and self.compare_info is not None
+            mp4_output = self.mp4_output_active()
+
+            if self.info is None or (self.info.kind == "gif" and not mp4_output):
                 self.loop_input = ui.input("Loop count").props("outlined dense").classes("w-full")
                 self.loop_input.set_value("0")
-            else:
+
+            if self.info is not None and (self.info.kind == "video" or compare_ready):
+                ui.separator()
+                ui.label("Comparison").classes("section-title")
+                self.side_by_side_checkbox = ui.checkbox(
+                    "Side-by-side comparison",
+                    value=bool(compare_ready and self.compare_enabled),
+                    on_change=lambda e: self.set_compare_enabled(e.value),
+                )
+                if not compare_ready:
+                    self.side_by_side_checkbox.disable()
+                    ui.label("Load second media to enable comparison output.").classes("muted")
+                with ui.row().classes("w-full gap-2"):
+                    self.label_left_input = ui.input("Left label").props("outlined dense").classes("grow")
+                    self.label_right_input = ui.input("Right label").props("outlined dense").classes("grow")
+                self.label_left_input.set_value("Before")
+                self.label_right_input.set_value("After")
+
+            if mp4_output:
                 ui.separator()
                 ui.label("Annotation").classes("section-title")
                 self.caption_input = ui.input("Caption/subtitle").props("outlined dense clearable").classes("w-full")
@@ -621,89 +1023,6 @@ class TrimTool:
                     ).classes("grow")
 
                 ui.separator()
-                ui.label("Comparison").classes("section-title")
-                compare_ready = self.compare_info is not None
-                self.side_by_side_checkbox = ui.checkbox(
-                    "Side-by-side comparison",
-                    value=bool(compare_ready and self.compare_enabled),
-                    on_change=lambda e: self.set_compare_enabled(e.value),
-                )
-                if not compare_ready:
-                    self.side_by_side_checkbox.disable()
-                    ui.label("Load a second video to enable comparison output.").classes("muted")
-                with ui.row().classes("w-full gap-2"):
-                    self.label_left_input = ui.input("Left label").props("outlined dense").classes("grow")
-                    self.label_right_input = ui.input("Right label").props("outlined dense").classes("grow")
-                self.label_left_input.set_value("Before")
-                self.label_right_input.set_value("After")
-
-                if compare_ready:
-                    ui.separator()
-                    ui.label("Second Video Trim").classes("section-title")
-                    self.compare_trim_label = ui.label(self.compare_trim_text()).classes("muted")
-                    self.compare_start_slider = ui.slider(
-                        min=0.0,
-                        max=compare_duration,
-                        value=compare_start,
-                        step=0.01,
-                        on_change=lambda e: self.set_compare_start(e.value),
-                    ).props("label-always")
-                    self.compare_end_slider = ui.slider(
-                        min=0.0,
-                        max=compare_duration,
-                        value=compare_end,
-                        step=0.01,
-                        on_change=lambda e: self.set_compare_end(e.value),
-                    ).props("label-always")
-                    with ui.row().classes("w-full gap-2"):
-                        self.compare_start_input = ui.number(
-                            "Start",
-                            value=round(compare_start, 3),
-                            min=0.0,
-                            step=0.1,
-                            on_change=lambda e: self.set_compare_start(e.value),
-                        ).props("outlined dense suffix=s").classes("grow")
-                        self.compare_end_input = ui.number(
-                            "End",
-                            value=round(compare_end, 3),
-                            min=0.0,
-                            step=0.1,
-                            on_change=lambda e: self.set_compare_end(e.value),
-                        ).props("outlined dense suffix=s").classes("grow")
-                    with ui.row().classes("w-full gap-2"):
-                        ui.button("Full Range", icon="select_all", on_click=self.full_compare_range).props(
-                            "outline"
-                        ).classes("grow")
-                        ui.button("Set 5s Clip", icon="timer", on_click=self.set_compare_five_second_clip).props(
-                            "outline"
-                        ).classes("grow")
-                    ui.label("Second Preview Position").classes("section-title")
-                    self.compare_scrub_slider = ui.slider(
-                        min=compare_scrub_min,
-                        max=compare_scrub_max,
-                        value=compare_scrub,
-                        step=0.01,
-                        on_change=lambda e: self.set_compare_scrub(e.value),
-                    ).props("label-always")
-                    self.compare_scrub_input = ui.number(
-                        "Scrub",
-                        value=round(compare_scrub, 3),
-                        min=compare_scrub_min,
-                        max=compare_scrub_max,
-                        step=0.1,
-                        on_change=lambda e: self.set_compare_scrub(e.value),
-                    ).props("outlined dense suffix=s").classes("w-full")
-                    with ui.row().classes("w-full gap-2"):
-                        ui.button("Play Second", icon="play_arrow", on_click=self.play_compare_trim_range).props(
-                            "unelevated"
-                        ).classes("grow")
-                        ui.button("Loop Second", icon="repeat", on_click=self.loop_compare_trim_range).props(
-                            "outline"
-                        ).classes("grow")
-                        ui.button("Pause Second", icon="pause", on_click=self.pause_compare_trim_preview).props(
-                            "outline"
-                        ).classes("grow")
-
                 self.crf_slider = ui.slider(min=16, max=30, value=20, step=1).props("label-always")
                 ui.label("CRF quality").classes("muted")
                 self.preset_select = ui.select(
@@ -712,11 +1031,13 @@ class TrimTool:
                     label="H.264 preset",
                 ).props("outlined dense").classes("w-full")
                 self.copy_checkbox = ui.checkbox("Fast copy mode")
+                if (self.info.kind != "video" or self.side_by_side_active()) and self.copy_checkbox is not None:
+                    self.copy_checkbox.disable()
 
             self.render_button = ui.button("Render Output", icon="content_cut", on_click=self.render).props(
                 "unelevated"
             ).classes("w-full")
-            self.status = ui.label("Load a GIF or MP4 to begin.").classes("muted")
+            self.status = ui.label("Load a GIF or video to begin.").classes("muted")
             self.command_label = ui.label("").classes("command-box w-full")
 
             self.apply_source_defaults()
@@ -750,9 +1071,10 @@ class TrimTool:
         self.compare_meta.clear()
         with self.compare_meta:
             if self.compare_info is None:
-                ui.label("No comparison video loaded.").classes("muted")
+                ui.label("No comparison media loaded.").classes("muted")
                 return
             rows = [
+                ("Type", "GIF" if self.compare_info.kind == "gif" else "Video"),
                 ("Duration", format_seconds(self.compare_info.duration)),
                 ("Size", f"{self.compare_info.width or '-'} x {self.compare_info.height or '-'}"),
                 ("Codec", self.compare_info.codec),
@@ -764,22 +1086,112 @@ class TrimTool:
                     ui.label(label).classes("muted")
                     ui.label(value)
 
+    def output_base_size(self) -> tuple[int, int] | None:
+        if self.info is None:
+            return None
+        if self.side_by_side_active():
+            return 1920, 1080
+        if self.info.width and self.info.height:
+            return int(self.info.width), int(self.info.height)
+        return None
+
+    def normalize_output_dimension(self, value: float) -> int:
+        if self.info is not None and self.info.kind == "video":
+            return max(2, int(round(value / 2.0) * 2))
+        return max(1, int(round(value)))
+
+    def output_dimensions_from_scale(self, percent: float) -> tuple[int, int] | None:
+        base_size = self.output_base_size()
+        if base_size is None:
+            return None
+        base_width, base_height = base_size
+        scale = max(10.0, min(parse_number(percent, 100.0), 100.0)) / 100.0
+        return (
+            self.normalize_output_dimension(base_width * scale),
+            self.normalize_output_dimension(base_height * scale),
+        )
+
+    def set_output_dimensions(self, width: int, height: int, scale_percent: float | None = None) -> None:
+        self.resize_syncing = True
+        try:
+            if self.width_input:
+                self.width_input.set_value(width)
+            if self.height_input:
+                self.height_input.set_value(height)
+            if scale_percent is not None:
+                scale_percent = max(10.0, min(scale_percent, 100.0))
+                if self.resize_scale_slider:
+                    self.resize_scale_slider.set_value(scale_percent)
+                if self.resize_scale_input:
+                    self.resize_scale_input.set_value(round(scale_percent, 1))
+            if self.output_size_label:
+                self.output_size_label.set_text(f"Output: {width}x{height}")
+        finally:
+            self.resize_syncing = False
+
+    def set_output_width(self, value: Any) -> None:
+        if self.resize_syncing:
+            return
+        base_size = self.output_base_size()
+        if base_size is None:
+            return
+        base_width, base_height = base_size
+        width = self.normalize_output_dimension(parse_number(value, base_width))
+        height = self.normalize_output_dimension(base_height * width / base_width)
+        self.set_output_dimensions(width, height, width * 100.0 / base_width)
+
+    def set_output_height(self, value: Any) -> None:
+        if self.resize_syncing:
+            return
+        base_size = self.output_base_size()
+        if base_size is None:
+            return
+        base_width, base_height = base_size
+        height = self.normalize_output_dimension(parse_number(value, base_height))
+        width = self.normalize_output_dimension(base_width * height / base_height)
+        self.set_output_dimensions(width, height, height * 100.0 / base_height)
+
+    def set_output_scale(self, value: Any) -> None:
+        if self.resize_syncing:
+            return
+        percent = max(10.0, min(parse_number(value, 100.0), 100.0))
+        dimensions = self.output_dimensions_from_scale(percent)
+        if dimensions is None:
+            return
+        self.set_output_dimensions(dimensions[0], dimensions[1], percent)
+
     def apply_source_defaults(self) -> None:
         if self.info is None:
             return
-        if self.info.kind == "video" and self.compare_info is not None and self.compare_enabled:
-            if self.width_input:
-                self.width_input.set_value("1920")
-            if self.height_input:
-                self.height_input.set_value("1080")
-        elif self.width_input and self.info.width:
-            self.width_input.set_value(str(self.info.width))
-            if self.height_input and self.info.height:
-                self.height_input.set_value(str(self.info.height))
-        elif self.height_input and self.info.height:
-            self.height_input.set_value(str(self.info.height))
+        base_size = self.output_base_size()
+        if base_size is not None:
+            self.set_output_dimensions(base_size[0], base_size[1], 100.0)
         if self.fps_input and self.info.fps:
             self.fps_input.set_value(f"{self.info.fps:.2f}".rstrip("0").rstrip("."))
+
+    def output_format_select_value(self) -> str:
+        if self.side_by_side_active():
+            return "mp4"
+        return self.output_format
+
+    def target_output_kind(self) -> str:
+        if self.info is None:
+            return "gif"
+        if self.side_by_side_active():
+            return "mp4"
+        if self.output_format in {"gif", "mp4"}:
+            return self.output_format
+        return self.info.kind
+
+    def set_output_format(self, value: Any) -> None:
+        next_format = str(value or "auto")
+        if next_format not in {"auto", "gif", "mp4"}:
+            next_format = "auto"
+        self.output_format = next_format
+        if self.output_input and self.info is not None:
+            self.output_input.set_value(str(self.default_output_path(self.info)))
+        self.apply_source_defaults()
+        self.controls_panel.refresh()
 
     def trim_text(self) -> str:
         if self.info is None:
@@ -828,8 +1240,8 @@ class TrimTool:
     async def handle_compare_upload(self, event: events.UploadEventArguments) -> None:
         filename = clean_filename(event.file.name)
         suffix = Path(filename).suffix.lower()
-        if suffix not in VIDEO_SUFFIXES:
-            ui.notify("Use a video file for side-by-side comparison.", type="negative")
+        if suffix not in ACCEPTED_SUFFIXES:
+            ui.notify("Use a GIF or browser-friendly video file for side-by-side comparison.", type="negative")
             return
 
         target = UPLOAD_DIR / f"{Path(filename).stem}-{secrets.token_hex(4)}{suffix}"
@@ -847,7 +1259,7 @@ class TrimTool:
     async def load_compare_path(self) -> None:
         raw_path = (self.compare_path_input.value or "").strip() if self.compare_path_input else ""
         if not raw_path:
-            ui.notify("Enter a second video path.", type="warning")
+            ui.notify("Enter a second media path.", type="warning")
             return
         await self.load_compare_media(Path(raw_path).expanduser())
 
@@ -856,19 +1268,37 @@ class TrimTool:
         if not path.exists() or not path.is_file():
             ui.notify("Source file was not found.", type="negative")
             return
+        self.stop_gif_playback()
         try:
-            info = await asyncio.to_thread(probe_media, path)
+            info = probe_media(path)
         except Exception as exc:
             ui.notify(f"Could not read media: {exc}", type="negative")
             return
 
         self.info = info
         self.output_path = None
-        self.compare_enabled = info.kind == "video" and self.compare_info is not None
+        self.compare_enabled = self.compare_info is not None
+        self.output_format = "auto"
         self.start_time = 0.0
         self.end_time = info.duration if info.duration > 0 else 1.0
         self.scrub_time = 0.0
         self.pending_scrub_updates.clear()
+        self.gif_video_preview_path = None
+        self.gif_preview_path = None
+        self.gif_preview_frames = []
+        self.gif_preview_frame_starts = []
+        if info.kind == "gif":
+            if self.status:
+                self.status.set_text("Preparing GIF preview...")
+                await asyncio.sleep(0)
+            try:
+                self.gif_video_preview_path = ensure_gif_video_preview(info.path)
+            except Exception as exc:
+                ui.notify(f"Could not prepare video preview; using frame preview: {exc}", type="warning")
+                try:
+                    await self.prepare_gif_preview(info)
+                except Exception as frame_exc:
+                    ui.notify(f"Could not prepare GIF frame preview: {frame_exc}", type="negative")
         if self.path_input:
             self.path_input.set_value(str(info.path))
         if self.output_input:
@@ -887,33 +1317,39 @@ class TrimTool:
             ui.notify("Comparison file was not found.", type="negative")
             return
         try:
-            info = await asyncio.to_thread(probe_media, path)
+            info = probe_media(path)
         except Exception as exc:
-            ui.notify(f"Could not read comparison video: {exc}", type="negative")
-            return
-        if info.kind != "video":
-            ui.notify("Comparison input must be a video file.", type="negative")
+            ui.notify(f"Could not read comparison media: {exc}", type="negative")
             return
 
         self.compare_info = info
-        self.compare_enabled = self.info is not None and self.info.kind == "video"
+        self.compare_video_preview_path = None
+        if info.kind == "gif":
+            if self.status:
+                self.status.set_text("Preparing comparison GIF preview...")
+                await asyncio.sleep(0)
+            try:
+                self.compare_video_preview_path = ensure_gif_video_preview(info.path)
+            except Exception as exc:
+                ui.notify(f"Could not prepare comparison GIF video preview: {exc}", type="warning")
+        self.compare_enabled = self.info is not None
         self.compare_start_time = 0.0
         self.compare_end_time = info.duration if info.duration > 0 else 1.0
         self.compare_scrub_time = 0.0
         self.pending_compare_scrub_updates.clear()
         if self.compare_path_input:
             self.compare_path_input.set_value(str(info.path))
-        if self.output_input and self.info is not None and self.info.kind == "video":
+        if self.output_input and self.info is not None:
             self.output_input.set_value(str(self.default_output_path(self.info)))
         self.refresh_compare_meta()
         self.preview_panel.refresh()
         self.controls_panel.refresh()
-        ui.notify(f"Loaded comparison video {info.path.name}", type="positive")
+        ui.notify(f"Loaded comparison media {info.path.name}", type="positive")
 
     def default_output_path(self, info: MediaInfo) -> Path:
-        if info.kind == "video" and self.compare_info is not None and self.compare_enabled:
+        if self.compare_info is not None and self.compare_enabled:
             return OUTPUT_DIR / f"{info.path.stem}-vs-{self.compare_info.path.stem}.mp4"
-        suffix = ".gif" if info.kind == "gif" else ".mp4"
+        suffix = ".gif" if self.target_output_kind() == "gif" else ".mp4"
         return OUTPUT_DIR / f"{info.path.stem}-trimmed{suffix}"
 
     def set_output_buttons(self, enabled: bool) -> None:
@@ -966,6 +1402,8 @@ class TrimTool:
             return
         if time.monotonic() < self.source_trim_event_guard_until:
             return
+        if self.info is not None and self.info.kind == "gif":
+            self.stop_gif_playback()
         duration = max(0.0, self.info.duration if self.info else 0.0)
         start = max(0.0, min(parse_number(value), duration))
         if self.end_time <= 0:
@@ -981,6 +1419,8 @@ class TrimTool:
             return
         if time.monotonic() < self.source_trim_event_guard_until:
             return
+        if self.info is not None and self.info.kind == "gif":
+            self.stop_gif_playback()
         duration = max(0.0, self.info.duration if self.info else 0.0)
         end = max(0.0, min(parse_number(value), duration))
         if end < self.start_time:
@@ -1014,6 +1454,7 @@ class TrimTool:
                 self.scrub_slider.set_value(self.scrub_time)
             if self.scrub_input:
                 self.scrub_input.set_value(round(self.scrub_time, 3))
+            self.update_gif_frame_preview()
         finally:
             self.syncing = False
 
@@ -1027,6 +1468,7 @@ class TrimTool:
                 self.scrub_slider.set_value(self.scrub_time)
             if self.scrub_input:
                 self.scrub_input.set_value(round(self.scrub_time, 3))
+            self.update_gif_frame_preview()
         finally:
             self.syncing = False
 
@@ -1039,6 +1481,8 @@ class TrimTool:
     def full_range(self) -> None:
         if self.info is None:
             return
+        if self.info.kind == "gif":
+            self.stop_gif_playback()
         self.source_trim_event_guard_until = time.monotonic() + 0.75
         self.start_time = 0.0
         self.end_time = self.info.duration
@@ -1048,6 +1492,8 @@ class TrimTool:
     def set_five_second_clip(self) -> None:
         if self.info is None:
             return
+        if self.info.kind == "gif":
+            self.stop_gif_playback()
         self.source_trim_event_guard_until = time.monotonic() + 0.75
         duration = max(0.0, self.info.duration)
         self.start_time = min(self.start_time, max(0.0, duration - 5.0))
@@ -1063,13 +1509,19 @@ class TrimTool:
         next_time = max(scrub_min, min(parse_number(value), scrub_max))
         if self.consume_pending_scrub_update(self.pending_scrub_updates, next_time):
             return
+        if self.info is not None and self.info.kind == "gif":
+            self.stop_gif_playback()
         if abs(next_time - self.scrub_time) < 0.03:
             self.scrub_time = next_time
             self.sync_scrub_controls()
             return
         self.scrub_time = next_time
         self.sync_scrub_controls()
-        if self.info is not None and self.info.kind == "video" and self.source_video is not None:
+        if (
+            self.info is not None
+            and self.source_video is not None
+            and (self.info.kind == "video" or self.gif_video_preview_path is not None)
+        ):
             await ui.run_javascript(
                 f"return window.giftoolSeekTrim({self.source_video.id}, {self.scrub_time:.6f})",
                 timeout=2,
@@ -1104,6 +1556,75 @@ class TrimTool:
         if self.source_video is None:
             return
         await ui.run_javascript(f"return window.giftoolPauseTrim({self.source_video.id})", timeout=2)
+
+    def stop_gif_playback(self) -> None:
+        task = self.gif_play_task
+        if task is not None and not task.done():
+            task.cancel()
+        self.gif_play_task = None
+
+    async def play_gif_range(self, loop: bool = False) -> None:
+        if self.info is None or self.info.kind != "gif":
+            ui.notify("Load a GIF first.", type="warning")
+            return
+        if self.end_time <= self.start_time:
+            ui.notify("End time must be greater than start time.", type="warning")
+            return
+
+        if self.gif_video_preview_path is not None and self.source_video is not None:
+            preview_start = self.preview_start_time()
+            ok = await ui.run_javascript(
+                "return window.giftoolPlayTrim("
+                f"{self.source_video.id}, {preview_start:.6f}, {self.end_time:.6f}, "
+                f"{str(loop).lower()}, {self.start_time:.6f})",
+                timeout=2,
+            )
+            if not ok:
+                ui.notify("Could not start the GIF preview.", type="negative")
+            return
+
+        if not self.gif_preview_frames:
+            ui.notify("GIF preview frames are not ready.", type="warning")
+            return
+        self.stop_gif_playback()
+        self.scrub_time = self.preview_start_time()
+        self.sync_scrub_controls()
+        self.gif_play_task = asyncio.create_task(self.run_gif_playback(loop))
+
+    async def loop_gif_range(self) -> None:
+        await self.play_gif_range(loop=True)
+
+    async def pause_gif_preview(self) -> None:
+        if self.gif_video_preview_path is not None and self.source_video is not None:
+            await ui.run_javascript(f"return window.giftoolPauseTrim({self.source_video.id})", timeout=2)
+            return
+        self.stop_gif_playback()
+
+    async def run_gif_playback(self, loop: bool) -> None:
+        tick = 1.0 / GIF_PLAYBACK_UI_FPS
+        last_tick = time.monotonic()
+        try:
+            while True:
+                await asyncio.sleep(tick)
+                now = time.monotonic()
+                self.scrub_time += now - last_tick
+                last_tick = now
+
+                if self.scrub_time >= self.end_time:
+                    if loop:
+                        self.scrub_time = self.start_time
+                        last_tick = time.monotonic()
+                    else:
+                        self.scrub_time = self.end_time
+                        self.sync_scrub_controls()
+                        break
+
+                self.sync_scrub_controls()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            if asyncio.current_task() is self.gif_play_task:
+                self.gif_play_task = None
 
     def set_compare_start(self, value: Any) -> None:
         if self.syncing:
@@ -1228,10 +1749,10 @@ class TrimTool:
 
     async def play_compare_trim_range(self, loop: bool = False) -> None:
         if self.compare_info is None or self.compare_video is None:
-            ui.notify("Load a comparison video first.", type="warning")
+            ui.notify("Load comparison media first.", type="warning")
             return
         if self.compare_end_time <= self.compare_start_time:
-            ui.notify("Second video end time must be greater than start time.", type="warning")
+            ui.notify("Second media end time must be greater than start time.", type="warning")
             return
         preview_start = self.compare_preview_start_time()
         ok = await ui.run_javascript(
@@ -1255,11 +1776,16 @@ class TrimTool:
         self.compare_enabled = bool(value) and self.compare_info is not None
         if self.output_input and self.info is not None:
             self.output_input.set_value(str(self.default_output_path(self.info)))
+        self.apply_source_defaults()
+        if self.info is not None and self.info.kind == "gif":
+            self.controls_panel.refresh()
+
+    def mp4_output_active(self) -> bool:
+        return self.target_output_kind() == "mp4"
 
     def side_by_side_active(self) -> bool:
         return bool(
             self.info is not None
-            and self.info.kind == "video"
             and self.compare_info is not None
             and self.compare_enabled
         )
@@ -1267,6 +1793,7 @@ class TrimTool:
     def clear_compare(self) -> None:
         self.compare_info = None
         self.compare_enabled = False
+        self.compare_video_preview_path = None
         self.compare_start_time = 0.0
         self.compare_end_time = 0.0
         self.compare_scrub_time = 0.0
@@ -1288,10 +1815,12 @@ class TrimTool:
         self.controls_panel.refresh()
 
     def reset(self) -> None:
+        self.stop_gif_playback()
         self.info = None
         self.compare_info = None
         self.compare_enabled = False
         self.output_path = None
+        self.output_format = "auto"
         self.start_time = 0.0
         self.end_time = 0.0
         self.scrub_time = 0.0
@@ -1300,6 +1829,12 @@ class TrimTool:
         self.compare_scrub_time = 0.0
         self.source_video = None
         self.compare_video = None
+        self.gif_frame_image = None
+        self.gif_video_preview_path = None
+        self.compare_video_preview_path = None
+        self.gif_preview_path = None
+        self.gif_preview_frames = []
+        self.gif_preview_frame_starts = []
         self.compare_trim_label = None
         self.compare_start_slider = None
         self.compare_end_slider = None
@@ -1323,21 +1858,31 @@ class TrimTool:
         self.preview_panel.refresh()
         self.controls_panel.refresh()
 
+    def output_dimension_value(self, control: Any) -> str:
+        if control is None or control.value in (None, ""):
+            return ""
+        value = parse_number(control.value, 0.0)
+        if value <= 0:
+            return ""
+        return str(int(round(value)))
+
     def build_command(self, output_path: Path) -> list[str]:
         if self.info is None:
             raise ValueError("Load media before rendering.")
         if self.end_time <= self.start_time:
             raise ValueError("End time must be greater than start time.")
 
-        backend = SCRIPT_DIR / ("giftool" if self.info.kind == "gif" else "videotool")
-        cmd = [str(backend), "-i", str(self.info.path), "-o", str(output_path)]
-
         selected_duration = self.end_time - self.start_time
         comparison_active = self.side_by_side_active()
+        target_kind = self.target_output_kind()
+        mp4_output = target_kind == "mp4"
+        backend = SCRIPT_DIR / ("videotool" if target_kind == "mp4" else "giftool")
+        cmd = [str(backend), "-i", str(self.info.path), "-o", str(output_path)]
+
         output_duration = selected_duration
         if comparison_active and self.compare_info is not None:
             if self.compare_end_time <= self.compare_start_time:
-                raise ValueError("Second video end time must be greater than start time.")
+                raise ValueError("Second media end time must be greater than start time.")
             output_duration = min(selected_duration, self.compare_end_time - self.compare_start_time)
             if output_duration <= 0:
                 raise ValueError("Side-by-side trim ranges must have positive duration.")
@@ -1346,8 +1891,8 @@ class TrimTool:
         if comparison_active or self.end_time < self.info.duration:
             cmd += ["-d", f"{output_duration:.3f}"]
 
-        width = (self.width_input.value or "").strip() if self.width_input else ""
-        height = (self.height_input.value or "").strip() if self.height_input else ""
+        width = self.output_dimension_value(self.width_input)
+        height = self.output_dimension_value(self.height_input)
         fps = (self.fps_input.value or "").strip() if self.fps_input else ""
         source_width = str(self.info.width or "")
         source_height = str(self.info.height or "")
@@ -1360,7 +1905,7 @@ class TrimTool:
         if fps and fps != source_fps:
             cmd += ["-f", fps]
 
-        if self.info.kind == "gif":
+        if not mp4_output:
             loop = (self.loop_input.value or "").strip() if self.loop_input else "0"
             if loop:
                 cmd += ["--loop", loop]
@@ -1382,7 +1927,7 @@ class TrimTool:
                 size = int(self.text_size_input.value) if self.text_size_input and self.text_size_input.value else 36
                 cmd += ["--text", caption, "--text-position", str(position), "--text-size", str(size)]
 
-            copy_mode = bool(self.copy_checkbox.value) if self.copy_checkbox else False
+            copy_mode = bool(self.copy_checkbox.value) if self.copy_checkbox and self.info.kind == "video" else False
             has_filters = any(flag in cmd for flag in ("-w", "-h", "-f"))
             if copy_mode and not has_filters and not comparison_active and not caption:
                 cmd.append("--copy")
@@ -1398,15 +1943,18 @@ class TrimTool:
             ui.notify("Render already in progress.", type="warning")
             return
         if self.info is None:
-            ui.notify("Load a GIF or MP4 first.", type="warning")
+            ui.notify("Load a GIF or video first.", type="warning")
             return
 
         raw_output = (self.output_input.value or "").strip() if self.output_input else ""
         output_path = Path(raw_output).expanduser() if raw_output else self.default_output_path(self.info)
+        target_kind = self.target_output_kind()
         if not output_path.suffix:
-            output_path = output_path.with_suffix(".gif" if self.info.kind == "gif" else ".mp4")
-        if self.info.kind == "video" and output_path.suffix.lower() != ".mp4":
+            output_path = output_path.with_suffix(".mp4" if target_kind == "mp4" else ".gif")
+        if target_kind == "mp4" and output_path.suffix.lower() != ".mp4":
             output_path = output_path.with_suffix(".mp4")
+        elif target_kind == "gif" and output_path.suffix.lower() != ".gif":
+            output_path = output_path.with_suffix(".gif")
 
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1469,14 +2017,36 @@ class TrimTool:
 
 
 def main() -> None:
+    args = parse_args(sys.argv[1:])
+    if args.native:
+        try:
+            import webview  # noqa: F401
+        except ModuleNotFoundError as exc:
+            print(
+                "pywebview is required for native mode.\n"
+                "Install it with:\n"
+                "  ./install-deps --native\n"
+                "or:\n"
+                "  python3 -m pip install --user pywebview",
+                file=sys.stderr,
+            )
+            raise SystemExit(1) from exc
+
     tool = TrimTool()
     tool.build()
+    port = args.port
+    if port is None and not args.native:
+        port = 8080
     ui.run(
-        title="GIF/MP4 Trim Tool",
-        host="127.0.0.1",
-        port=int(os.environ.get("GIFTOOL_UI_PORT", "8080")),
+        title="ClipFlip Studio",
+        host=args.host,
+        port=port,
+        native=args.native,
+        window_size=args.window_size,
+        fullscreen=args.fullscreen,
+        frameless=args.frameless,
         reload=False,
-        show=os.environ.get("GIFTOOL_UI_SHOW", "1").lower() not in {"0", "false", "no"},
+        show=False if args.native else not args.no_show,
     )
 
 

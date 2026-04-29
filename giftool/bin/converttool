@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  clipflip-convert -i INPUT -o OUTPUT [options]
+
+Options:
+  -i, --input FILE        Input GIF or video file
+  -o, --output FILE       Output .gif or .mp4 file
+      --format FORMAT     Output format: gif or mp4; inferred from output extension if omitted
+  -s, --start SECONDS     Start time in seconds
+  -e, --end SECONDS       End time in seconds
+  -d, --duration SECONDS  Duration in seconds
+  -w, --width PIXELS      Output width, keeps aspect ratio if height omitted
+  -h, --height PIXELS     Output height, keeps aspect ratio if width omitted
+  -f, --fps FPS           Output frames per second
+      --loop COUNT        GIF loop count, 0 means infinite; GIF output only
+      --crf CRF           MP4 H.264 quality, lower is better; default 20
+      --preset PRESET     MP4 H.264 preset; default medium
+      --stats             Print ffmpeg progress
+      --help              Show this help
+
+Examples:
+  clipflip-convert -i clip.mp4 -o clip.gif -s 1 -d 3 -w 480
+  clipflip-convert -i animation.gif -o animation.mp4 --fps 30
+  clipflip-convert -i input.mov -o output --format gif
+EOF
+}
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+input=""
+output=""
+format=""
+start=""
+end=""
+duration=""
+width=""
+height=""
+fps=""
+loop="0"
+crf="20"
+preset="medium"
+stats=""
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -i|--input)
+      input="${2:-}"; shift 2 ;;
+    -o|--output)
+      output="${2:-}"; shift 2 ;;
+    --format)
+      format="${2:-}"; shift 2 ;;
+    -s|--start)
+      start="${2:-}"; shift 2 ;;
+    -e|--end)
+      end="${2:-}"; shift 2 ;;
+    -d|--duration)
+      duration="${2:-}"; shift 2 ;;
+    -w|--width)
+      width="${2:-}"; shift 2 ;;
+    -h|--height)
+      height="${2:-}"; shift 2 ;;
+    -f|--fps)
+      fps="${2:-}"; shift 2 ;;
+    --loop)
+      loop="${2:-}"; shift 2 ;;
+    --crf)
+      crf="${2:-}"; shift 2 ;;
+    --preset)
+      preset="${2:-}"; shift 2 ;;
+    --stats)
+      stats="1"; shift ;;
+    --help)
+      usage; exit 0 ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1 ;;
+  esac
+done
+
+if [[ -z "$input" || -z "$output" ]]; then
+  usage >&2
+  exit 1
+fi
+
+if [[ ! -f "$input" ]]; then
+  echo "Input file not found: $input" >&2
+  exit 1
+fi
+
+if [[ -z "$format" ]]; then
+  case "${output,,}" in
+    *.gif)
+      format="gif" ;;
+    *.mp4|*.m4v)
+      format="mp4" ;;
+    *)
+      echo "Could not infer output format from '$output'. Use --format gif or --format mp4." >&2
+      exit 1 ;;
+  esac
+fi
+
+case "$format" in
+  gif|mp4) ;;
+  *)
+    echo "--format must be gif or mp4." >&2
+    exit 1 ;;
+esac
+
+case "${output,,}" in
+  *.gif|*.mp4|*.m4v) ;;
+  *)
+    output="${output}.${format}" ;;
+esac
+
+mkdir -p "$(dirname "$output")"
+
+if [[ "$format" == "gif" ]]; then
+  cmd=("$script_dir/giftool" -i "$input" -o "$output")
+  [[ -n "$start" ]] && cmd+=(-s "$start")
+  [[ -n "$end" ]] && cmd+=(-e "$end")
+  [[ -n "$duration" ]] && cmd+=(-d "$duration")
+  [[ -n "$width" ]] && cmd+=(-w "$width")
+  [[ -n "$height" ]] && cmd+=(-h "$height")
+  [[ -n "$fps" ]] && cmd+=(-f "$fps")
+  cmd+=(--loop "$loop")
+  [[ -n "$stats" ]] && cmd+=(--stats)
+else
+  cmd=("$script_dir/videotool" -i "$input" -o "$output")
+  [[ -n "$start" ]] && cmd+=(-s "$start")
+  [[ -n "$end" ]] && cmd+=(-e "$end")
+  [[ -n "$duration" ]] && cmd+=(-d "$duration")
+  [[ -n "$width" ]] && cmd+=(-w "$width")
+  [[ -n "$height" ]] && cmd+=(-h "$height")
+  [[ -n "$fps" ]] && cmd+=(-f "$fps")
+  cmd+=(--crf "$crf" --preset "$preset")
+  [[ -n "$stats" ]] && cmd+=(--stats)
+fi
+
+exec "${cmd[@]}"

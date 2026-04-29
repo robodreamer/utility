@@ -4,10 +4,10 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  giftool -i INPUT.gif -o OUTPUT.gif [options]
+  giftool -i INPUT -o OUTPUT.gif [options]
 
 Options:
-  -i, --input FILE        Input animated GIF
+  -i, --input FILE        Input GIF or video file
   -o, --output FILE       Output GIF
   -s, --start SECONDS     Start time in seconds
   -e, --end SECONDS       End time in seconds
@@ -21,6 +21,7 @@ Options:
 
 Examples:
   giftool -i in.gif -o out.gif -s 1.2 -d 2.5 -w 480
+  giftool -i clip.mp4 -o clip.gif -s 1.0 -d 3.0 -w 480
   giftool -i in.gif -o out.gif -e 3.0 -h 240 -f 12
 EOF
 }

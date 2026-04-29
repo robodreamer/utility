@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+native="1"
+args=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --browser|--no-native)
+      native=""; shift ;;
+    *)
+      args+=("$1"); shift ;;
+  esac
+done
+
+if [[ -n "$native" ]]; then
+  exec "$script_dir/giftool-ui" --native "${args[@]}"
+fi
+
+exec "$script_dir/giftool-ui" "${args[@]}"

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+project_dir="$(cd "$script_dir/.." && pwd)"
+version="${CLIPFLIP_VERSION:-0.1.0}"
+dist_dir="$project_dir/dist"
+stage_dir="$dist_dir/clipflip-studio-$version"
+archive="$dist_dir/clipflip-studio-$version.tar.gz"
+
+rm -rf "$stage_dir"
+mkdir -p "$stage_dir"
+
+cp -R "$project_dir/bin" "$stage_dir/bin"
+cp -R "$project_dir/packaging" "$stage_dir/packaging"
+[[ -d "$project_dir/assets" ]] && cp -R "$project_dir/assets" "$stage_dir/assets"
+cp "$project_dir/install-deps" "$stage_dir/install-deps"
+cp "$project_dir/requirements.txt" "$stage_dir/requirements.txt"
+cp "$project_dir/README.md" "$stage_dir/README.md"
+cp "$project_dir/LICENSE" "$stage_dir/LICENSE"
+cp "$project_dir/pyproject.toml" "$stage_dir/pyproject.toml"
+cp "$project_dir/setup.cfg" "$stage_dir/setup.cfg"
+
+find "$stage_dir/bin" "$stage_dir/packaging" -type f -exec chmod +x {} \;
+
+tar -C "$dist_dir" -czf "$archive" "clipflip-studio-$version"
+echo "$archive"

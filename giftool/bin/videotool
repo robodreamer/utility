@@ -4,10 +4,10 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  videotool -i INPUT.mp4 -o OUTPUT.mp4 [options]
+  videotool -i INPUT -o OUTPUT.mp4 [options]
 
 Options:
-  -i, --input FILE        Input video file
+  -i, --input FILE        Input GIF or video file
   -o, --output FILE       Output MP4 file
   -s, --start SECONDS     Start time in seconds
   -e, --end SECONDS       End time in seconds
@@ -18,7 +18,7 @@ Options:
       --text TEXT         Burn one subtitle-style text overlay into the video
       --text-position POS top, center, or bottom; default bottom
       --text-size PIXELS  Text size for --text; default 36
-      --compare FILE      Build a side-by-side comparison with another video
+      --compare FILE      Build a side-by-side comparison with another GIF or video
       --compare-start SEC Start time for the comparison video
       --compare-end SEC   End time for the comparison video
       --compare-duration SEC
@@ -34,6 +34,7 @@ Options:
 
 Examples:
   videotool -i in.mp4 -o out.mp4 -s 4.2 -d 8.0
+  videotool -i animation.gif -o animation.mp4 --fps 30
   videotool -i in.mp4 -o out.mp4 -e 12.0 -w 1280 --crf 22
   videotool -i in.mp4 -o clip.mp4 -s 30 -d 10 --copy
   videotool -i before.mp4 --compare after.mp4 -o side-by-side.mp4 -s 2 -d 10 --compare-start 1 --compare-duration 10 --label-left Before --label-right After
