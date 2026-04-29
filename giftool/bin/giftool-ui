@@ -1,0 +1,1484 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import re
+import secrets
+import shlex
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+try:
+    from nicegui import events, ui
+except ModuleNotFoundError as exc:
+    missing = exc.name or "nicegui"
+    print(
+        f"{missing} is required for giftool-ui.\n"
+        "Install the UI dependencies with:\n"
+        "  python3 -m pip install --user -r "
+        f"{Path(__file__).resolve().parents[1] / 'requirements.txt'}",
+        file=sys.stderr,
+    )
+    raise SystemExit(1) from exc
+
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+CACHE_DIR = Path(os.environ.get("GIFTOOL_UI_CACHE", str(Path.home() / ".cache" / "giftool-ui"))).expanduser()
+UPLOAD_DIR = CACHE_DIR / "uploads"
+OUTPUT_DIR = CACHE_DIR / "outputs"
+
+VIDEO_SUFFIXES = {".mp4", ".m4v", ".mov", ".webm"}
+GIF_SUFFIXES = {".gif"}
+ACCEPTED_SUFFIXES = VIDEO_SUFFIXES | GIF_SUFFIXES
+
+
+@dataclass
+class MediaInfo:
+    path: Path
+    kind: str
+    duration: float
+    width: int | None
+    height: int | None
+    codec: str
+    fps: float | None
+    frame_count: str | None
+
+
+def clean_filename(name: str) -> str:
+    base = Path(name.replace("\x00", "")).name
+    base = re.sub(r"[^A-Za-z0-9._ -]+", "_", base).strip(" .")
+    return base or "upload"
+
+
+def media_kind(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in GIF_SUFFIXES:
+        return "gif"
+    if suffix in VIDEO_SUFFIXES:
+        return "video"
+    raise ValueError(f"Unsupported file type: {suffix or '(none)'}")
+
+
+def parse_fraction(value: str | None) -> float | None:
+    if not value or value == "0/0":
+        return None
+    if "/" in value:
+        numerator, denominator = value.split("/", 1)
+        try:
+            den = float(denominator)
+            return None if den == 0 else float(numerator) / den
+        except ValueError:
+            return None
+    try:
+        return float(value)
+    except ValueError:
+        return None
+
+
+def format_seconds(value: float) -> str:
+    if value < 60:
+        return f"{value:.2f}s"
+    minutes, seconds = divmod(value, 60)
+    return f"{int(minutes)}m {seconds:05.2f}s"
+
+
+def parse_number(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def probe_media(path: Path) -> MediaInfo:
+    kind = media_kind(path)
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_entries",
+        "format=duration:stream=codec_type,codec_name,width,height,avg_frame_rate,r_frame_rate,nb_frames",
+        "-of",
+        "json",
+        str(path),
+    ]
+    result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+    payload = json.loads(result.stdout or "{}")
+
+    stream = next(
+        (item for item in payload.get("streams", []) if item.get("codec_type") == "video"),
+        {},
+    )
+    duration = parse_number(payload.get("format", {}).get("duration"), 0.0)
+    if duration <= 0 and kind == "gif":
+        duration = probe_gif_duration(path)
+
+    fps = parse_fraction(stream.get("avg_frame_rate")) or parse_fraction(stream.get("r_frame_rate"))
+    return MediaInfo(
+        path=path,
+        kind=kind,
+        duration=max(0.0, duration),
+        width=stream.get("width"),
+        height=stream.get("height"),
+        codec=stream.get("codec_name") or "-",
+        fps=fps,
+        frame_count=stream.get("nb_frames"),
+    )
+
+
+def probe_gif_duration(path: Path) -> float:
+    try:
+        from PIL import Image, ImageSequence
+    except ModuleNotFoundError:
+        return 0.0
+
+    total_ms = 0
+    with Image.open(path) as image:
+        for frame in ImageSequence.Iterator(image):
+            total_ms += max(10, int(frame.info.get("duration", 100)))
+    return total_ms / 1000.0
+
+
+def shell_join(cmd: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in cmd)
+
+
+class TrimTool:
+    def __init__(self) -> None:
+        UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+        self.info: MediaInfo | None = None
+        self.compare_info: MediaInfo | None = None
+        self.compare_enabled = False
+        self.output_path: Path | None = None
+        self.start_time = 0.0
+        self.end_time = 0.0
+        self.scrub_time = 0.0
+        self.compare_start_time = 0.0
+        self.compare_end_time = 0.0
+        self.compare_scrub_time = 0.0
+        self.rendering = False
+        self.syncing = False
+        self.source_trim_event_guard_until = 0.0
+        self.compare_trim_event_guard_until = 0.0
+        self.pending_scrub_updates: list[tuple[float, float]] = []
+        self.pending_compare_scrub_updates: list[tuple[float, float]] = []
+
+        self.path_input = None
+        self.compare_path_input = None
+        self.source_upload = None
+        self.compare_upload = None
+        self.output_input = None
+        self.status = None
+        self.meta = None
+        self.compare_meta = None
+        self.trim_label = None
+        self.command_label = None
+        self.output_meta = None
+        self.render_button = None
+        self.open_output_button = None
+        self.download_button = None
+        self.source_video = None
+        self.compare_video = None
+        self.start_slider = None
+        self.end_slider = None
+        self.scrub_slider = None
+        self.start_input = None
+        self.end_input = None
+        self.scrub_input = None
+        self.compare_trim_label = None
+        self.compare_start_slider = None
+        self.compare_end_slider = None
+        self.compare_scrub_slider = None
+        self.compare_start_input = None
+        self.compare_end_input = None
+        self.compare_scrub_input = None
+        self.width_input = None
+        self.height_input = None
+        self.fps_input = None
+        self.loop_input = None
+        self.crf_slider = None
+        self.preset_select = None
+        self.copy_checkbox = None
+        self.side_by_side_checkbox = None
+        self.caption_input = None
+        self.text_position_select = None
+        self.text_size_input = None
+        self.label_left_input = None
+        self.label_right_input = None
+
+    def build(self) -> None:
+        ui.page_title("GIF/MP4 Trim Tool")
+        ui.colors(primary="#2563eb", secondary="#0f766e", accent="#d97706")
+        ui.add_head_html(
+            """
+            <script>
+              window.giftoolTrimTimers = window.giftoolTrimTimers || {};
+
+              window.giftoolPauseTrim = (videoId) => {
+                const component = getElement(videoId);
+                const video = component && component.$el;
+                if (!video) return false;
+                if (window.giftoolTrimTimers[videoId]) {
+                  clearInterval(window.giftoolTrimTimers[videoId]);
+                  delete window.giftoolTrimTimers[videoId];
+                }
+                video.pause();
+                return true;
+              };
+
+              window.giftoolSeekTrim = (videoId, time) => {
+                const component = getElement(videoId);
+                const video = component && component.$el;
+                if (!video || !Number.isFinite(time)) return false;
+                window.giftoolPauseTrim(videoId);
+                video.currentTime = time;
+                return true;
+              };
+
+              window.giftoolPlayTrim = (videoId, start, end, loop = false, loopStart = start) => {
+                const component = getElement(videoId);
+                const video = component && component.$el;
+                if (!video || !Number.isFinite(start) || !Number.isFinite(end) || end <= start) return false;
+
+                window.giftoolPauseTrim(videoId);
+
+                const stopAtEnd = () => {
+                  if (video.currentTime >= end || video.ended) {
+                    if (loop) {
+                      video.currentTime = loopStart;
+                      const playResult = video.play();
+                      if (playResult && playResult.catch) {
+                        playResult.catch((error) => console.warn("Preview playback failed", error));
+                      }
+                    } else {
+                      video.pause();
+                      video.currentTime = end;
+                      clearInterval(window.giftoolTrimTimers[videoId]);
+                      delete window.giftoolTrimTimers[videoId];
+                    }
+                  }
+                };
+
+                const begin = () => {
+                  video.currentTime = start;
+                  window.giftoolTrimTimers[videoId] = setInterval(stopAtEnd, 50);
+                  const playResult = video.play();
+                  if (playResult && playResult.catch) {
+                    playResult.catch((error) => console.warn("Preview playback failed", error));
+                  }
+                };
+
+                if (video.readyState < 1) {
+                  video.addEventListener("loadedmetadata", begin, {once: true});
+                  video.load();
+                } else {
+                  begin();
+                }
+
+                return true;
+              };
+            </script>
+            <style>
+              body {
+                background: #f6f8fb;
+                color: #172033;
+              }
+              .app-shell {
+                max-width: 1440px;
+                margin: 0 auto;
+                padding: 18px;
+              }
+              .app-header {
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                gap: 16px;
+                margin-bottom: 14px;
+              }
+              .brand-mark {
+                width: 36px;
+                height: 36px;
+                border-radius: 8px;
+                background: #172033;
+                color: #ffffff;
+                display: grid;
+                place-items: center;
+                font-weight: 700;
+              }
+              .tool-grid {
+                display: grid;
+                grid-template-columns: minmax(280px, 360px) minmax(380px, 1fr) minmax(300px, 390px);
+                gap: 14px;
+                align-items: start;
+              }
+              .panel {
+                background: #ffffff;
+                border: 1px solid #dbe2ec;
+                border-radius: 8px;
+                box-shadow: 0 8px 24px rgba(25, 33, 52, 0.06);
+                padding: 16px;
+              }
+              .section-title {
+                color: #172033;
+                font-size: 0.95rem;
+                font-weight: 700;
+                letter-spacing: 0;
+              }
+              .muted {
+                color: #64748b;
+                font-size: 0.86rem;
+              }
+              .preview-surface {
+                background: #111827;
+                border: 1px solid #243244;
+                border-radius: 8px;
+                min-height: 420px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                overflow: hidden;
+              }
+              .media-view {
+                width: 100%;
+                max-height: 560px;
+                object-fit: contain;
+                background: #111827;
+              }
+              .compare-preview {
+                display: grid;
+                grid-template-columns: 1fr 1fr;
+                gap: 10px;
+                width: 100%;
+              }
+              .compare-preview video {
+                width: 100%;
+                max-height: 420px;
+                object-fit: contain;
+                background: #111827;
+                border-radius: 6px;
+              }
+              .empty-preview {
+                color: #cbd5e1;
+                text-align: center;
+              }
+              .command-box {
+                background: #0f172a;
+                color: #dbeafe;
+                border-radius: 8px;
+                padding: 12px;
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: 0.78rem;
+                white-space: pre-wrap;
+                overflow-wrap: anywhere;
+              }
+              .metric-row {
+                display: grid;
+                grid-template-columns: 84px 1fr;
+                gap: 8px;
+                line-height: 1.45;
+              }
+              @media (max-width: 1120px) {
+                .tool-grid {
+                  grid-template-columns: 1fr;
+                }
+                .preview-surface {
+                  min-height: 300px;
+                }
+                .compare-preview {
+                  grid-template-columns: 1fr;
+                }
+              }
+            </style>
+            """
+        )
+
+        with ui.column().classes("app-shell w-full gap-0"):
+            with ui.element("div").classes("app-header"):
+                with ui.row().classes("items-center gap-3"):
+                    ui.label("G").classes("brand-mark")
+                    with ui.column().classes("gap-0"):
+                        ui.label("GIF/MP4 Trim Tool").classes("text-h5 text-weight-bold")
+                        ui.label("Local ffmpeg trimming with a browser UI").classes("muted")
+                ui.button("Render", icon="content_cut", on_click=self.render).props("unelevated").classes("px-5")
+
+            with ui.element("div").classes("tool-grid"):
+                self.source_panel()
+                self.preview_panel()
+                self.controls_panel()
+
+    def source_panel(self) -> None:
+        with ui.column().classes("panel gap-4"):
+            ui.label("Source").classes("section-title")
+            self.source_upload = ui.upload(on_upload=self.handle_upload, auto_upload=True).props(
+                'accept=".gif,.mp4,.m4v,.mov,.webm,video/*,image/gif"'
+            ).classes("hidden")
+            self.path_input = ui.input("Local path").props("outlined dense clearable").classes("w-full")
+            with ui.row().classes("w-full gap-2"):
+                ui.button("Load File", icon="upload_file").props("unelevated").classes("grow").on(
+                    "click",
+                    js_handler=f'() => runMethod({self.source_upload.id}, "pickFiles", [])',
+                )
+                ui.button("Load Path", icon="folder_open", on_click=self.load_path).props("outline").classes("grow")
+                ui.button("Reset", icon="restart_alt", on_click=self.reset).props("outline").classes("grow")
+
+            ui.separator()
+            self.meta = ui.column().classes("gap-1 w-full")
+            self.refresh_meta()
+
+            ui.separator()
+            ui.label("Comparison").classes("section-title")
+            self.compare_upload = ui.upload(on_upload=self.handle_compare_upload, auto_upload=True).props(
+                'accept=".mp4,.m4v,.mov,.webm,video/*"'
+            ).classes("hidden")
+            self.compare_path_input = ui.input("Second video path").props("outlined dense clearable").classes("w-full")
+            with ui.row().classes("w-full gap-2"):
+                ui.button("Load Second", icon="video_library").props("outline").classes("grow").on(
+                    "click",
+                    js_handler=f'() => runMethod({self.compare_upload.id}, "pickFiles", [])',
+                )
+                ui.button("Load Path", icon="folder_open", on_click=self.load_compare_path).props(
+                    "outline"
+                ).classes("grow")
+                ui.button("Clear", icon="close", on_click=self.clear_compare).props("outline").classes("grow")
+            self.compare_meta = ui.column().classes("gap-1 w-full")
+            self.refresh_compare_meta()
+
+            ui.separator()
+            self.output_input = ui.input("Output path").props("outlined dense").classes("w-full")
+            with ui.row().classes("w-full gap-2"):
+                self.open_output_button = ui.button(
+                    "ffplay", icon="play_circle", on_click=self.open_output_external
+                ).props("outline disabled").classes("grow")
+                self.download_button = ui.button(
+                    "Download", icon="download", on_click=self.download_output
+                ).props("outline disabled").classes("grow")
+            self.output_meta = ui.label("No output rendered.").classes("muted")
+
+    @ui.refreshable
+    def preview_panel(self) -> None:
+        self.source_video = None
+        self.compare_video = None
+        with ui.column().classes("panel gap-4"):
+            with ui.row().classes("items-center justify-between w-full"):
+                ui.label("Preview").classes("section-title")
+                if self.info is not None:
+                    ui.label(self.info.path.name).classes("muted")
+
+            with ui.element("div").classes("preview-surface"):
+                if self.info is None:
+                    with ui.column().classes("empty-preview items-center gap-2"):
+                        ui.icon("movie").classes("text-5xl")
+                        ui.label("No media loaded")
+                elif self.info.kind == "gif":
+                    ui.image(self.info.path).classes("media-view")
+                elif self.compare_info:
+                    with ui.element("div").classes("compare-preview"):
+                        self.source_video = ui.video(self.info.path).props("controls preload=metadata muted")
+                        self.source_video.on(
+                            "timeupdate",
+                            self.on_preview_time_update,
+                            js_handler="(event) => emit(event.target.currentTime)",
+                            throttle=0.1,
+                        )
+                        self.compare_video = ui.video(self.compare_info.path).props("controls preload=metadata muted")
+                        self.compare_video.on(
+                            "timeupdate",
+                            self.on_compare_time_update,
+                            js_handler="(event) => emit(event.target.currentTime)",
+                            throttle=0.1,
+                        )
+                else:
+                    self.source_video = ui.video(self.info.path).props("controls preload=metadata muted").classes(
+                        "media-view"
+                    )
+                    self.source_video.on(
+                        "timeupdate",
+                        self.on_preview_time_update,
+                        js_handler="(event) => emit(event.target.currentTime)",
+                        throttle=0.1,
+                    )
+
+            if self.output_path:
+                ui.label("Rendered Output").classes("section-title")
+                with ui.element("div").classes("preview-surface"):
+                    if self.output_path.suffix.lower() == ".gif":
+                        ui.image(self.output_path).classes("media-view")
+                    else:
+                        ui.video(self.output_path).props("controls preload=metadata muted").classes("media-view")
+
+    @ui.refreshable
+    def controls_panel(self) -> None:
+        self.scrub_slider = None
+        self.scrub_input = None
+        self.compare_trim_label = None
+        self.compare_start_slider = None
+        self.compare_end_slider = None
+        self.compare_scrub_slider = None
+        self.compare_start_input = None
+        self.compare_end_input = None
+        self.compare_scrub_input = None
+        duration = max(0.01, self.info.duration if self.info else 1.0)
+        start = min(self.start_time, duration)
+        end = self.end_time if self.end_time > 0 else duration
+        end = min(max(start, end), duration)
+        scrub_min, scrub_max = self.scrub_bounds()
+        scrub = min(max(self.scrub_time, scrub_min), scrub_max)
+        compare_duration = max(0.01, self.compare_info.duration if self.compare_info else 1.0)
+        compare_start = min(self.compare_start_time, compare_duration)
+        compare_end = self.compare_end_time if self.compare_end_time > 0 else compare_duration
+        compare_end = min(max(compare_start, compare_end), compare_duration)
+        compare_scrub_min, compare_scrub_max = self.compare_scrub_bounds()
+        compare_scrub = min(max(self.compare_scrub_time, compare_scrub_min), compare_scrub_max)
+
+        with ui.column().classes("panel gap-4"):
+            ui.label("Trim").classes("section-title")
+            self.trim_label = ui.label(self.trim_text()).classes("muted")
+            self.start_slider = ui.slider(
+                min=0.0,
+                max=duration,
+                value=start,
+                step=0.01,
+                on_change=lambda e: self.set_start(e.value),
+            ).props("label-always")
+            self.end_slider = ui.slider(
+                min=0.0,
+                max=duration,
+                value=end,
+                step=0.01,
+                on_change=lambda e: self.set_end(e.value),
+            ).props("label-always")
+            with ui.row().classes("w-full gap-2"):
+                self.start_input = ui.number(
+                    "Start",
+                    value=round(start, 3),
+                    min=0.0,
+                    step=0.1,
+                    on_change=lambda e: self.set_start(e.value),
+                ).props("outlined dense suffix=s").classes("grow")
+                self.end_input = ui.number(
+                    "End",
+                    value=round(end, 3),
+                    min=0.0,
+                    step=0.1,
+                    on_change=lambda e: self.set_end(e.value),
+                ).props("outlined dense suffix=s").classes("grow")
+            with ui.row().classes("w-full gap-2"):
+                ui.button("Full Range", icon="select_all", on_click=self.full_range).props("outline").classes("grow")
+                ui.button("Set 5s Clip", icon="timer", on_click=self.set_five_second_clip).props("outline").classes("grow")
+            if self.info is not None and self.info.kind == "video":
+                ui.label("Preview Position").classes("section-title")
+                self.scrub_slider = ui.slider(
+                    min=scrub_min,
+                    max=scrub_max,
+                    value=scrub,
+                    step=0.01,
+                    on_change=lambda e: self.set_scrub(e.value),
+                ).props("label-always")
+                self.scrub_input = ui.number(
+                    "Scrub",
+                    value=round(scrub, 3),
+                    min=scrub_min,
+                    max=scrub_max,
+                    step=0.1,
+                    on_change=lambda e: self.set_scrub(e.value),
+                ).props("outlined dense suffix=s").classes("w-full")
+                with ui.row().classes("w-full gap-2"):
+                    ui.button("Play Once", icon="play_arrow", on_click=self.play_trim_range).props(
+                        "unelevated"
+                    ).classes("grow")
+                    ui.button("Loop Range", icon="repeat", on_click=self.loop_trim_range).props("outline").classes("grow")
+                    ui.button("Pause", icon="pause", on_click=self.pause_trim_preview).props("outline").classes("grow")
+
+            ui.separator()
+            ui.label("Output").classes("section-title")
+            with ui.row().classes("w-full gap-2"):
+                self.width_input = ui.input("Width").props("outlined dense").classes("grow")
+                self.height_input = ui.input("Height").props("outlined dense").classes("grow")
+            self.fps_input = ui.input("FPS").props("outlined dense").classes("w-full")
+
+            if self.info is None or self.info.kind == "gif":
+                self.loop_input = ui.input("Loop count").props("outlined dense").classes("w-full")
+                self.loop_input.set_value("0")
+            else:
+                ui.separator()
+                ui.label("Annotation").classes("section-title")
+                self.caption_input = ui.input("Caption/subtitle").props("outlined dense clearable").classes("w-full")
+                with ui.row().classes("w-full gap-2"):
+                    self.text_position_select = ui.select(
+                        ["bottom", "top", "center"],
+                        value="bottom",
+                        label="Caption position",
+                    ).props("outlined dense").classes("grow")
+                    self.text_size_input = ui.number("Text size", value=36, min=12, max=96, step=2).props(
+                        "outlined dense"
+                    ).classes("grow")
+
+                ui.separator()
+                ui.label("Comparison").classes("section-title")
+                compare_ready = self.compare_info is not None
+                self.side_by_side_checkbox = ui.checkbox(
+                    "Side-by-side comparison",
+                    value=bool(compare_ready and self.compare_enabled),
+                    on_change=lambda e: self.set_compare_enabled(e.value),
+                )
+                if not compare_ready:
+                    self.side_by_side_checkbox.disable()
+                    ui.label("Load a second video to enable comparison output.").classes("muted")
+                with ui.row().classes("w-full gap-2"):
+                    self.label_left_input = ui.input("Left label").props("outlined dense").classes("grow")
+                    self.label_right_input = ui.input("Right label").props("outlined dense").classes("grow")
+                self.label_left_input.set_value("Before")
+                self.label_right_input.set_value("After")
+
+                if compare_ready:
+                    ui.separator()
+                    ui.label("Second Video Trim").classes("section-title")
+                    self.compare_trim_label = ui.label(self.compare_trim_text()).classes("muted")
+                    self.compare_start_slider = ui.slider(
+                        min=0.0,
+                        max=compare_duration,
+                        value=compare_start,
+                        step=0.01,
+                        on_change=lambda e: self.set_compare_start(e.value),
+                    ).props("label-always")
+                    self.compare_end_slider = ui.slider(
+                        min=0.0,
+                        max=compare_duration,
+                        value=compare_end,
+                        step=0.01,
+                        on_change=lambda e: self.set_compare_end(e.value),
+                    ).props("label-always")
+                    with ui.row().classes("w-full gap-2"):
+                        self.compare_start_input = ui.number(
+                            "Start",
+                            value=round(compare_start, 3),
+                            min=0.0,
+                            step=0.1,
+                            on_change=lambda e: self.set_compare_start(e.value),
+                        ).props("outlined dense suffix=s").classes("grow")
+                        self.compare_end_input = ui.number(
+                            "End",
+                            value=round(compare_end, 3),
+                            min=0.0,
+                            step=0.1,
+                            on_change=lambda e: self.set_compare_end(e.value),
+                        ).props("outlined dense suffix=s").classes("grow")
+                    with ui.row().classes("w-full gap-2"):
+                        ui.button("Full Range", icon="select_all", on_click=self.full_compare_range).props(
+                            "outline"
+                        ).classes("grow")
+                        ui.button("Set 5s Clip", icon="timer", on_click=self.set_compare_five_second_clip).props(
+                            "outline"
+                        ).classes("grow")
+                    ui.label("Second Preview Position").classes("section-title")
+                    self.compare_scrub_slider = ui.slider(
+                        min=compare_scrub_min,
+                        max=compare_scrub_max,
+                        value=compare_scrub,
+                        step=0.01,
+                        on_change=lambda e: self.set_compare_scrub(e.value),
+                    ).props("label-always")
+                    self.compare_scrub_input = ui.number(
+                        "Scrub",
+                        value=round(compare_scrub, 3),
+                        min=compare_scrub_min,
+                        max=compare_scrub_max,
+                        step=0.1,
+                        on_change=lambda e: self.set_compare_scrub(e.value),
+                    ).props("outlined dense suffix=s").classes("w-full")
+                    with ui.row().classes("w-full gap-2"):
+                        ui.button("Play Second", icon="play_arrow", on_click=self.play_compare_trim_range).props(
+                            "unelevated"
+                        ).classes("grow")
+                        ui.button("Loop Second", icon="repeat", on_click=self.loop_compare_trim_range).props(
+                            "outline"
+                        ).classes("grow")
+                        ui.button("Pause Second", icon="pause", on_click=self.pause_compare_trim_preview).props(
+                            "outline"
+                        ).classes("grow")
+
+                self.crf_slider = ui.slider(min=16, max=30, value=20, step=1).props("label-always")
+                ui.label("CRF quality").classes("muted")
+                self.preset_select = ui.select(
+                    ["veryfast", "faster", "fast", "medium", "slow", "slower"],
+                    value="medium",
+                    label="H.264 preset",
+                ).props("outlined dense").classes("w-full")
+                self.copy_checkbox = ui.checkbox("Fast copy mode")
+
+            self.render_button = ui.button("Render Output", icon="content_cut", on_click=self.render).props(
+                "unelevated"
+            ).classes("w-full")
+            self.status = ui.label("Load a GIF or MP4 to begin.").classes("muted")
+            self.command_label = ui.label("").classes("command-box w-full")
+
+            self.apply_source_defaults()
+
+    def refresh_meta(self) -> None:
+        if self.meta is None:
+            return
+        self.meta.clear()
+        with self.meta:
+            if self.info is None:
+                ui.label("No source loaded.").classes("muted")
+                return
+            rows = [
+                ("Type", "GIF" if self.info.kind == "gif" else "Video"),
+                ("Duration", format_seconds(self.info.duration)),
+                ("Size", f"{self.info.width or '-'} x {self.info.height or '-'}"),
+                ("Codec", self.info.codec),
+            ]
+            if self.info.fps:
+                rows.append(("FPS", f"{self.info.fps:.2f}"))
+            if self.info.frame_count:
+                rows.append(("Frames", self.info.frame_count))
+            for label, value in rows:
+                with ui.element("div").classes("metric-row"):
+                    ui.label(label).classes("muted")
+                    ui.label(value)
+
+    def refresh_compare_meta(self) -> None:
+        if self.compare_meta is None:
+            return
+        self.compare_meta.clear()
+        with self.compare_meta:
+            if self.compare_info is None:
+                ui.label("No comparison video loaded.").classes("muted")
+                return
+            rows = [
+                ("Duration", format_seconds(self.compare_info.duration)),
+                ("Size", f"{self.compare_info.width or '-'} x {self.compare_info.height or '-'}"),
+                ("Codec", self.compare_info.codec),
+            ]
+            if self.compare_info.fps:
+                rows.append(("FPS", f"{self.compare_info.fps:.2f}"))
+            for label, value in rows:
+                with ui.element("div").classes("metric-row"):
+                    ui.label(label).classes("muted")
+                    ui.label(value)
+
+    def apply_source_defaults(self) -> None:
+        if self.info is None:
+            return
+        if self.info.kind == "video" and self.compare_info is not None and self.compare_enabled:
+            if self.width_input:
+                self.width_input.set_value("1920")
+            if self.height_input:
+                self.height_input.set_value("1080")
+        elif self.width_input and self.info.width:
+            self.width_input.set_value(str(self.info.width))
+            if self.height_input and self.info.height:
+                self.height_input.set_value(str(self.info.height))
+        elif self.height_input and self.info.height:
+            self.height_input.set_value(str(self.info.height))
+        if self.fps_input and self.info.fps:
+            self.fps_input.set_value(f"{self.info.fps:.2f}".rstrip("0").rstrip("."))
+
+    def trim_text(self) -> str:
+        if self.info is None:
+            return "0.00s selected"
+        selected = max(0.0, self.end_time - self.start_time)
+        return f"{format_seconds(self.start_time)} to {format_seconds(self.end_time)} ({format_seconds(selected)})"
+
+    def compare_trim_text(self) -> str:
+        if self.compare_info is None:
+            return "0.00s selected"
+        selected = max(0.0, self.compare_end_time - self.compare_start_time)
+        return (
+            f"{format_seconds(self.compare_start_time)} to "
+            f"{format_seconds(self.compare_end_time)} ({format_seconds(selected)})"
+        )
+
+    def remember_pending_scrub_update(self, queue: list[tuple[float, float]], value: float) -> None:
+        queue.append((value, time.monotonic()))
+        del queue[:-20]
+
+    def consume_pending_scrub_update(self, queue: list[tuple[float, float]], value: float) -> bool:
+        now = time.monotonic()
+        matched = False
+        kept: list[tuple[float, float]] = []
+        for pending_value, created_at in queue:
+            if now - created_at > 1.0:
+                continue
+            if not matched and abs(pending_value - value) <= 0.05:
+                matched = True
+                continue
+            kept.append((pending_value, created_at))
+        queue[:] = kept[-20:]
+        return matched
+
+    async def handle_upload(self, event: events.UploadEventArguments) -> None:
+        filename = clean_filename(event.file.name)
+        suffix = Path(filename).suffix.lower()
+        if suffix not in ACCEPTED_SUFFIXES:
+            ui.notify("Use a GIF or browser-friendly video file.", type="negative")
+            return
+
+        target = UPLOAD_DIR / f"{Path(filename).stem}-{secrets.token_hex(4)}{suffix}"
+        await event.file.save(target)
+        await self.load_media(target)
+
+    async def handle_compare_upload(self, event: events.UploadEventArguments) -> None:
+        filename = clean_filename(event.file.name)
+        suffix = Path(filename).suffix.lower()
+        if suffix not in VIDEO_SUFFIXES:
+            ui.notify("Use a video file for side-by-side comparison.", type="negative")
+            return
+
+        target = UPLOAD_DIR / f"{Path(filename).stem}-{secrets.token_hex(4)}{suffix}"
+        await event.file.save(target)
+        await self.load_compare_media(target)
+
+    async def load_path(self) -> None:
+        raw_path = (self.path_input.value or "").strip() if self.path_input else ""
+        if not raw_path:
+            ui.notify("Enter a local media path.", type="warning")
+            return
+        path = Path(raw_path).expanduser()
+        await self.load_media(path)
+
+    async def load_compare_path(self) -> None:
+        raw_path = (self.compare_path_input.value or "").strip() if self.compare_path_input else ""
+        if not raw_path:
+            ui.notify("Enter a second video path.", type="warning")
+            return
+        await self.load_compare_media(Path(raw_path).expanduser())
+
+    async def load_media(self, path: Path) -> None:
+        path = path.expanduser()
+        if not path.exists() or not path.is_file():
+            ui.notify("Source file was not found.", type="negative")
+            return
+        try:
+            info = await asyncio.to_thread(probe_media, path)
+        except Exception as exc:
+            ui.notify(f"Could not read media: {exc}", type="negative")
+            return
+
+        self.info = info
+        self.output_path = None
+        self.compare_enabled = info.kind == "video" and self.compare_info is not None
+        self.start_time = 0.0
+        self.end_time = info.duration if info.duration > 0 else 1.0
+        self.scrub_time = 0.0
+        self.pending_scrub_updates.clear()
+        if self.path_input:
+            self.path_input.set_value(str(info.path))
+        if self.output_input:
+            self.output_input.set_value(str(self.default_output_path(info)))
+        if self.output_meta:
+            self.output_meta.set_text("No output rendered.")
+        self.set_output_buttons(False)
+        self.refresh_meta()
+        self.preview_panel.refresh()
+        self.controls_panel.refresh()
+        ui.notify(f"Loaded {info.path.name}", type="positive")
+
+    async def load_compare_media(self, path: Path) -> None:
+        path = path.expanduser()
+        if not path.exists() or not path.is_file():
+            ui.notify("Comparison file was not found.", type="negative")
+            return
+        try:
+            info = await asyncio.to_thread(probe_media, path)
+        except Exception as exc:
+            ui.notify(f"Could not read comparison video: {exc}", type="negative")
+            return
+        if info.kind != "video":
+            ui.notify("Comparison input must be a video file.", type="negative")
+            return
+
+        self.compare_info = info
+        self.compare_enabled = self.info is not None and self.info.kind == "video"
+        self.compare_start_time = 0.0
+        self.compare_end_time = info.duration if info.duration > 0 else 1.0
+        self.compare_scrub_time = 0.0
+        self.pending_compare_scrub_updates.clear()
+        if self.compare_path_input:
+            self.compare_path_input.set_value(str(info.path))
+        if self.output_input and self.info is not None and self.info.kind == "video":
+            self.output_input.set_value(str(self.default_output_path(self.info)))
+        self.refresh_compare_meta()
+        self.preview_panel.refresh()
+        self.controls_panel.refresh()
+        ui.notify(f"Loaded comparison video {info.path.name}", type="positive")
+
+    def default_output_path(self, info: MediaInfo) -> Path:
+        if info.kind == "video" and self.compare_info is not None and self.compare_enabled:
+            return OUTPUT_DIR / f"{info.path.stem}-vs-{self.compare_info.path.stem}.mp4"
+        suffix = ".gif" if info.kind == "gif" else ".mp4"
+        return OUTPUT_DIR / f"{info.path.stem}-trimmed{suffix}"
+
+    def set_output_buttons(self, enabled: bool) -> None:
+        for button in (self.open_output_button, self.download_button):
+            if button is None:
+                continue
+            if enabled:
+                button.enable()
+            else:
+                button.disable()
+
+    def scrub_bounds(self) -> tuple[float, float]:
+        if self.info is None:
+            return 0.0, 1.0
+        duration = max(0.01, self.info.duration)
+        start = max(0.0, min(self.start_time, duration))
+        end = self.end_time if self.end_time > 0 else duration
+        end = max(start, min(end, duration))
+        return start, end if end > start else min(duration, start + 0.01)
+
+    def compare_scrub_bounds(self) -> tuple[float, float]:
+        if self.compare_info is None:
+            return 0.0, 1.0
+        duration = max(0.01, self.compare_info.duration)
+        start = max(0.0, min(self.compare_start_time, duration))
+        end = self.compare_end_time if self.compare_end_time > 0 else duration
+        end = max(start, min(end, duration))
+        return start, end if end > start else min(duration, start + 0.01)
+
+    def update_scrub_control_bounds(self) -> None:
+        scrub_min, scrub_max = self.scrub_bounds()
+        if self.scrub_slider:
+            self.scrub_slider.props["min"] = scrub_min
+            self.scrub_slider.props["max"] = scrub_max
+        if self.scrub_input:
+            self.scrub_input.props["min"] = scrub_min
+            self.scrub_input.props["max"] = scrub_max
+
+    def update_compare_scrub_control_bounds(self) -> None:
+        scrub_min, scrub_max = self.compare_scrub_bounds()
+        if self.compare_scrub_slider:
+            self.compare_scrub_slider.props["min"] = scrub_min
+            self.compare_scrub_slider.props["max"] = scrub_max
+        if self.compare_scrub_input:
+            self.compare_scrub_input.props["min"] = scrub_min
+            self.compare_scrub_input.props["max"] = scrub_max
+
+    def set_start(self, value: Any) -> None:
+        if self.syncing:
+            return
+        if time.monotonic() < self.source_trim_event_guard_until:
+            return
+        duration = max(0.0, self.info.duration if self.info else 0.0)
+        start = max(0.0, min(parse_number(value), duration))
+        if self.end_time <= 0:
+            self.end_time = duration
+        if start > self.end_time:
+            self.end_time = start
+        self.start_time = start
+        self.clamp_scrub_to_media()
+        self.sync_trim_controls()
+
+    def set_end(self, value: Any) -> None:
+        if self.syncing:
+            return
+        if time.monotonic() < self.source_trim_event_guard_until:
+            return
+        duration = max(0.0, self.info.duration if self.info else 0.0)
+        end = max(0.0, min(parse_number(value), duration))
+        if end < self.start_time:
+            self.start_time = end
+        self.end_time = end
+        self.clamp_scrub_to_media()
+        self.sync_trim_controls()
+
+    def clamp_scrub_to_media(self) -> None:
+        if self.info is None:
+            self.scrub_time = 0.0
+            return
+        scrub_min, scrub_max = self.scrub_bounds()
+        self.scrub_time = max(scrub_min, min(self.scrub_time, scrub_max))
+
+    def sync_trim_controls(self) -> None:
+        self.syncing = True
+        try:
+            self.update_scrub_control_bounds()
+            if self.start_slider:
+                self.start_slider.set_value(self.start_time)
+            if self.end_slider:
+                self.end_slider.set_value(self.end_time)
+            if self.start_input:
+                self.start_input.set_value(round(self.start_time, 3))
+            if self.end_input:
+                self.end_input.set_value(round(self.end_time, 3))
+            if self.trim_label:
+                self.trim_label.set_text(self.trim_text())
+            if self.scrub_slider:
+                self.scrub_slider.set_value(self.scrub_time)
+            if self.scrub_input:
+                self.scrub_input.set_value(round(self.scrub_time, 3))
+        finally:
+            self.syncing = False
+
+    def sync_scrub_controls(self) -> None:
+        self.syncing = True
+        try:
+            self.update_scrub_control_bounds()
+            if self.scrub_slider or self.scrub_input:
+                self.remember_pending_scrub_update(self.pending_scrub_updates, self.scrub_time)
+            if self.scrub_slider:
+                self.scrub_slider.set_value(self.scrub_time)
+            if self.scrub_input:
+                self.scrub_input.set_value(round(self.scrub_time, 3))
+        finally:
+            self.syncing = False
+
+    def on_preview_time_update(self, event: events.GenericEventArguments) -> None:
+        raw_value = event.args[0] if isinstance(event.args, list) and event.args else event.args
+        scrub_min, scrub_max = self.scrub_bounds()
+        self.scrub_time = max(scrub_min, min(parse_number(raw_value, self.scrub_time), scrub_max))
+        self.sync_scrub_controls()
+
+    def full_range(self) -> None:
+        if self.info is None:
+            return
+        self.source_trim_event_guard_until = time.monotonic() + 0.75
+        self.start_time = 0.0
+        self.end_time = self.info.duration
+        self.clamp_scrub_to_media()
+        self.sync_trim_controls()
+
+    def set_five_second_clip(self) -> None:
+        if self.info is None:
+            return
+        self.source_trim_event_guard_until = time.monotonic() + 0.75
+        duration = max(0.0, self.info.duration)
+        self.start_time = min(self.start_time, max(0.0, duration - 5.0))
+        self.end_time = min(duration, self.start_time + 5.0)
+        self.scrub_time = self.start_time
+        self.clamp_scrub_to_media()
+        self.sync_trim_controls()
+
+    async def set_scrub(self, value: Any) -> None:
+        if self.syncing:
+            return
+        scrub_min, scrub_max = self.scrub_bounds()
+        next_time = max(scrub_min, min(parse_number(value), scrub_max))
+        if self.consume_pending_scrub_update(self.pending_scrub_updates, next_time):
+            return
+        if abs(next_time - self.scrub_time) < 0.03:
+            self.scrub_time = next_time
+            self.sync_scrub_controls()
+            return
+        self.scrub_time = next_time
+        self.sync_scrub_controls()
+        if self.info is not None and self.info.kind == "video" and self.source_video is not None:
+            await ui.run_javascript(
+                f"return window.giftoolSeekTrim({self.source_video.id}, {self.scrub_time:.6f})",
+                timeout=2,
+            )
+
+    def preview_start_time(self) -> float:
+        if self.start_time <= self.scrub_time < self.end_time:
+            return self.scrub_time
+        return self.start_time
+
+    async def play_trim_range(self, loop: bool = False) -> None:
+        if self.info is None or self.info.kind != "video" or self.source_video is None:
+            ui.notify("Load a video first.", type="warning")
+            return
+        if self.end_time <= self.start_time:
+            ui.notify("End time must be greater than start time.", type="warning")
+            return
+        preview_start = self.preview_start_time()
+        ok = await ui.run_javascript(
+            "return window.giftoolPlayTrim("
+            f"{self.source_video.id}, {preview_start:.6f}, {self.end_time:.6f}, "
+            f"{str(loop).lower()}, {self.start_time:.6f})",
+            timeout=2,
+        )
+        if not ok:
+            ui.notify("Could not start the trim preview.", type="negative")
+
+    async def loop_trim_range(self) -> None:
+        await self.play_trim_range(loop=True)
+
+    async def pause_trim_preview(self) -> None:
+        if self.source_video is None:
+            return
+        await ui.run_javascript(f"return window.giftoolPauseTrim({self.source_video.id})", timeout=2)
+
+    def set_compare_start(self, value: Any) -> None:
+        if self.syncing:
+            return
+        if time.monotonic() < self.compare_trim_event_guard_until:
+            return
+        duration = max(0.0, self.compare_info.duration if self.compare_info else 0.0)
+        start = max(0.0, min(parse_number(value), duration))
+        if self.compare_end_time <= 0:
+            self.compare_end_time = duration
+        if start > self.compare_end_time:
+            self.compare_end_time = start
+        self.compare_start_time = start
+        self.clamp_compare_scrub_to_media()
+        self.sync_compare_trim_controls()
+
+    def set_compare_end(self, value: Any) -> None:
+        if self.syncing:
+            return
+        if time.monotonic() < self.compare_trim_event_guard_until:
+            return
+        duration = max(0.0, self.compare_info.duration if self.compare_info else 0.0)
+        end = max(0.0, min(parse_number(value), duration))
+        if end < self.compare_start_time:
+            self.compare_start_time = end
+        self.compare_end_time = end
+        self.clamp_compare_scrub_to_media()
+        self.sync_compare_trim_controls()
+
+    def clamp_compare_scrub_to_media(self) -> None:
+        if self.compare_info is None:
+            self.compare_scrub_time = 0.0
+            return
+        scrub_min, scrub_max = self.compare_scrub_bounds()
+        self.compare_scrub_time = max(scrub_min, min(self.compare_scrub_time, scrub_max))
+
+    def sync_compare_trim_controls(self) -> None:
+        self.syncing = True
+        try:
+            self.update_compare_scrub_control_bounds()
+            if self.compare_start_slider:
+                self.compare_start_slider.set_value(self.compare_start_time)
+            if self.compare_end_slider:
+                self.compare_end_slider.set_value(self.compare_end_time)
+            if self.compare_start_input:
+                self.compare_start_input.set_value(round(self.compare_start_time, 3))
+            if self.compare_end_input:
+                self.compare_end_input.set_value(round(self.compare_end_time, 3))
+            if self.compare_trim_label:
+                self.compare_trim_label.set_text(self.compare_trim_text())
+            if self.compare_scrub_slider or self.compare_scrub_input:
+                self.remember_pending_scrub_update(self.pending_compare_scrub_updates, self.compare_scrub_time)
+            if self.compare_scrub_slider:
+                self.compare_scrub_slider.set_value(self.compare_scrub_time)
+            if self.compare_scrub_input:
+                self.compare_scrub_input.set_value(round(self.compare_scrub_time, 3))
+        finally:
+            self.syncing = False
+
+    def sync_compare_scrub_controls(self) -> None:
+        self.syncing = True
+        try:
+            self.update_compare_scrub_control_bounds()
+            if self.compare_scrub_slider or self.compare_scrub_input:
+                self.remember_pending_scrub_update(self.pending_compare_scrub_updates, self.compare_scrub_time)
+            if self.compare_scrub_slider:
+                self.compare_scrub_slider.set_value(self.compare_scrub_time)
+            if self.compare_scrub_input:
+                self.compare_scrub_input.set_value(round(self.compare_scrub_time, 3))
+        finally:
+            self.syncing = False
+
+    def on_compare_time_update(self, event: events.GenericEventArguments) -> None:
+        raw_value = event.args[0] if isinstance(event.args, list) and event.args else event.args
+        scrub_min, scrub_max = self.compare_scrub_bounds()
+        self.compare_scrub_time = max(scrub_min, min(parse_number(raw_value, self.compare_scrub_time), scrub_max))
+        self.sync_compare_scrub_controls()
+
+    def full_compare_range(self) -> None:
+        if self.compare_info is None:
+            return
+        self.compare_trim_event_guard_until = time.monotonic() + 0.75
+        self.compare_start_time = 0.0
+        self.compare_end_time = self.compare_info.duration if self.compare_info.duration > 0 else 1.0
+        self.clamp_compare_scrub_to_media()
+        self.sync_compare_trim_controls()
+
+    def set_compare_five_second_clip(self) -> None:
+        if self.compare_info is None:
+            return
+        self.compare_trim_event_guard_until = time.monotonic() + 0.75
+        duration = max(0.0, self.compare_info.duration)
+        self.compare_start_time = min(self.compare_start_time, max(0.0, duration - 5.0))
+        self.compare_end_time = min(duration, self.compare_start_time + 5.0)
+        self.compare_scrub_time = self.compare_start_time
+        self.clamp_compare_scrub_to_media()
+        self.sync_compare_trim_controls()
+
+    async def set_compare_scrub(self, value: Any) -> None:
+        if self.syncing:
+            return
+        scrub_min, scrub_max = self.compare_scrub_bounds()
+        next_time = max(scrub_min, min(parse_number(value), scrub_max))
+        if self.consume_pending_scrub_update(self.pending_compare_scrub_updates, next_time):
+            return
+        if abs(next_time - self.compare_scrub_time) < 0.03:
+            self.compare_scrub_time = next_time
+            self.sync_compare_scrub_controls()
+            return
+        self.compare_scrub_time = next_time
+        self.sync_compare_scrub_controls()
+        if self.compare_info is not None and self.compare_video is not None:
+            await ui.run_javascript(
+                f"return window.giftoolSeekTrim({self.compare_video.id}, {self.compare_scrub_time:.6f})",
+                timeout=2,
+            )
+
+    def compare_preview_start_time(self) -> float:
+        if self.compare_start_time <= self.compare_scrub_time < self.compare_end_time:
+            return self.compare_scrub_time
+        return self.compare_start_time
+
+    async def play_compare_trim_range(self, loop: bool = False) -> None:
+        if self.compare_info is None or self.compare_video is None:
+            ui.notify("Load a comparison video first.", type="warning")
+            return
+        if self.compare_end_time <= self.compare_start_time:
+            ui.notify("Second video end time must be greater than start time.", type="warning")
+            return
+        preview_start = self.compare_preview_start_time()
+        ok = await ui.run_javascript(
+            "return window.giftoolPlayTrim("
+            f"{self.compare_video.id}, {preview_start:.6f}, {self.compare_end_time:.6f}, "
+            f"{str(loop).lower()}, {self.compare_start_time:.6f})",
+            timeout=2,
+        )
+        if not ok:
+            ui.notify("Could not start the second trim preview.", type="negative")
+
+    async def loop_compare_trim_range(self) -> None:
+        await self.play_compare_trim_range(loop=True)
+
+    async def pause_compare_trim_preview(self) -> None:
+        if self.compare_video is None:
+            return
+        await ui.run_javascript(f"return window.giftoolPauseTrim({self.compare_video.id})", timeout=2)
+
+    def set_compare_enabled(self, value: Any) -> None:
+        self.compare_enabled = bool(value) and self.compare_info is not None
+        if self.output_input and self.info is not None:
+            self.output_input.set_value(str(self.default_output_path(self.info)))
+
+    def side_by_side_active(self) -> bool:
+        return bool(
+            self.info is not None
+            and self.info.kind == "video"
+            and self.compare_info is not None
+            and self.compare_enabled
+        )
+
+    def clear_compare(self) -> None:
+        self.compare_info = None
+        self.compare_enabled = False
+        self.compare_start_time = 0.0
+        self.compare_end_time = 0.0
+        self.compare_scrub_time = 0.0
+        self.compare_video = None
+        self.compare_trim_label = None
+        self.compare_start_slider = None
+        self.compare_end_slider = None
+        self.compare_scrub_slider = None
+        self.compare_start_input = None
+        self.compare_end_input = None
+        self.compare_scrub_input = None
+        self.pending_compare_scrub_updates.clear()
+        if self.compare_path_input:
+            self.compare_path_input.set_value("")
+        if self.output_input and self.info is not None:
+            self.output_input.set_value(str(self.default_output_path(self.info)))
+        self.refresh_compare_meta()
+        self.preview_panel.refresh()
+        self.controls_panel.refresh()
+
+    def reset(self) -> None:
+        self.info = None
+        self.compare_info = None
+        self.compare_enabled = False
+        self.output_path = None
+        self.start_time = 0.0
+        self.end_time = 0.0
+        self.scrub_time = 0.0
+        self.compare_start_time = 0.0
+        self.compare_end_time = 0.0
+        self.compare_scrub_time = 0.0
+        self.source_video = None
+        self.compare_video = None
+        self.compare_trim_label = None
+        self.compare_start_slider = None
+        self.compare_end_slider = None
+        self.compare_scrub_slider = None
+        self.compare_start_input = None
+        self.compare_end_input = None
+        self.compare_scrub_input = None
+        self.pending_scrub_updates.clear()
+        self.pending_compare_scrub_updates.clear()
+        if self.path_input:
+            self.path_input.set_value("")
+        if self.compare_path_input:
+            self.compare_path_input.set_value("")
+        if self.output_input:
+            self.output_input.set_value("")
+        if self.output_meta:
+            self.output_meta.set_text("No output rendered.")
+        self.set_output_buttons(False)
+        self.refresh_meta()
+        self.refresh_compare_meta()
+        self.preview_panel.refresh()
+        self.controls_panel.refresh()
+
+    def build_command(self, output_path: Path) -> list[str]:
+        if self.info is None:
+            raise ValueError("Load media before rendering.")
+        if self.end_time <= self.start_time:
+            raise ValueError("End time must be greater than start time.")
+
+        backend = SCRIPT_DIR / ("giftool" if self.info.kind == "gif" else "videotool")
+        cmd = [str(backend), "-i", str(self.info.path), "-o", str(output_path)]
+
+        selected_duration = self.end_time - self.start_time
+        comparison_active = self.side_by_side_active()
+        output_duration = selected_duration
+        if comparison_active and self.compare_info is not None:
+            if self.compare_end_time <= self.compare_start_time:
+                raise ValueError("Second video end time must be greater than start time.")
+            output_duration = min(selected_duration, self.compare_end_time - self.compare_start_time)
+            if output_duration <= 0:
+                raise ValueError("Side-by-side trim ranges must have positive duration.")
+        if self.start_time > 0:
+            cmd += ["-s", f"{self.start_time:.3f}"]
+        if comparison_active or self.end_time < self.info.duration:
+            cmd += ["-d", f"{output_duration:.3f}"]
+
+        width = (self.width_input.value or "").strip() if self.width_input else ""
+        height = (self.height_input.value or "").strip() if self.height_input else ""
+        fps = (self.fps_input.value or "").strip() if self.fps_input else ""
+        source_width = str(self.info.width or "")
+        source_height = str(self.info.height or "")
+        source_fps = f"{self.info.fps:.2f}".rstrip("0").rstrip(".") if self.info.fps else ""
+
+        if width and width != source_width:
+            cmd += ["-w", width]
+        if height and height != source_height:
+            cmd += ["-h", height]
+        if fps and fps != source_fps:
+            cmd += ["-f", fps]
+
+        if self.info.kind == "gif":
+            loop = (self.loop_input.value or "").strip() if self.loop_input else "0"
+            if loop:
+                cmd += ["--loop", loop]
+        else:
+            caption = (self.caption_input.value or "").strip() if self.caption_input else ""
+            if comparison_active and self.compare_info is not None:
+                cmd += ["--compare", str(self.compare_info.path)]
+                if self.compare_start_time > 0:
+                    cmd += ["--compare-start", f"{self.compare_start_time:.3f}"]
+                cmd += ["--compare-duration", f"{output_duration:.3f}"]
+                label_left = (self.label_left_input.value or "").strip() if self.label_left_input else ""
+                label_right = (self.label_right_input.value or "").strip() if self.label_right_input else ""
+                if label_left:
+                    cmd += ["--label-left", label_left]
+                if label_right:
+                    cmd += ["--label-right", label_right]
+            if caption:
+                position = self.text_position_select.value if self.text_position_select else "bottom"
+                size = int(self.text_size_input.value) if self.text_size_input and self.text_size_input.value else 36
+                cmd += ["--text", caption, "--text-position", str(position), "--text-size", str(size)]
+
+            copy_mode = bool(self.copy_checkbox.value) if self.copy_checkbox else False
+            has_filters = any(flag in cmd for flag in ("-w", "-h", "-f"))
+            if copy_mode and not has_filters and not comparison_active and not caption:
+                cmd.append("--copy")
+            else:
+                crf = int(self.crf_slider.value) if self.crf_slider else 20
+                preset = self.preset_select.value if self.preset_select else "medium"
+                cmd += ["--crf", str(crf), "--preset", str(preset)]
+
+        return cmd
+
+    async def render(self) -> None:
+        if self.rendering:
+            ui.notify("Render already in progress.", type="warning")
+            return
+        if self.info is None:
+            ui.notify("Load a GIF or MP4 first.", type="warning")
+            return
+
+        raw_output = (self.output_input.value or "").strip() if self.output_input else ""
+        output_path = Path(raw_output).expanduser() if raw_output else self.default_output_path(self.info)
+        if not output_path.suffix:
+            output_path = output_path.with_suffix(".gif" if self.info.kind == "gif" else ".mp4")
+        if self.info.kind == "video" and output_path.suffix.lower() != ".mp4":
+            output_path = output_path.with_suffix(".mp4")
+
+        try:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            cmd = self.build_command(output_path)
+        except Exception as exc:
+            ui.notify(str(exc), type="negative")
+            return
+
+        if self.command_label:
+            self.command_label.set_text(shell_join(cmd))
+        if self.status:
+            self.status.set_text("Rendering...")
+        self.rendering = True
+        if self.render_button:
+            self.render_button.disable()
+
+        try:
+            await asyncio.to_thread(subprocess.run, cmd, check=True, capture_output=True, text=True)
+        except subprocess.CalledProcessError as exc:
+            message = (exc.stderr or exc.stdout or "Render failed.").strip()
+            ui.notify(message[:500], type="negative")
+            if self.status:
+                self.status.set_text("Render failed.")
+            return
+        finally:
+            self.rendering = False
+            if self.render_button:
+                self.render_button.enable()
+
+        self.output_path = output_path
+        if self.output_input:
+            self.output_input.set_value(str(output_path))
+        if self.output_meta:
+            size_mb = output_path.stat().st_size / (1024 * 1024)
+            self.output_meta.set_text(f"Rendered {output_path.name} ({size_mb:.2f} MB)")
+        if self.status:
+            self.status.set_text("Render complete.")
+        self.set_output_buttons(True)
+        self.preview_panel.refresh()
+        ui.notify("Render complete.", type="positive")
+
+    def open_output_external(self) -> None:
+        if self.output_path is None or not self.output_path.exists():
+            ui.notify("Render an output first.", type="warning")
+            return
+        try:
+            subprocess.Popen(
+                ["ffplay", "-autoexit", "-window_title", self.output_path.name, str(self.output_path)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+        except Exception as exc:
+            ui.notify(f"Could not launch ffplay: {exc}", type="negative")
+
+    def download_output(self) -> None:
+        if self.output_path is None or not self.output_path.exists():
+            ui.notify("Render an output first.", type="warning")
+            return
+        ui.download(str(self.output_path), filename=self.output_path.name)
+
+
+def main() -> None:
+    tool = TrimTool()
+    tool.build()
+    ui.run(
+        title="GIF/MP4 Trim Tool",
+        host="127.0.0.1",
+        port=int(os.environ.get("GIFTOOL_UI_PORT", "8080")),
+        reload=False,
+        show=os.environ.get("GIFTOOL_UI_SHOW", "1").lower() not in {"0", "false", "no"},
+    )
+
+
+if __name__ in {"__main__", "__mp_main__"}:
+    main()
