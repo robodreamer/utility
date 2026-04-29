@@ -1,13 +1,73 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+usage() {
+  cat <<'EOF'
+Usage:
+  ./packaging/install-desktop-entry [options]
+
+Options:
+      --exec PATH   Launcher executable or command (default: ~/.local/bin/clipflip)
+      --help        Show this help
+EOF
+}
+
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 project_dir="$(cd "$script_dir/.." && pwd)"
-apps_dir="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
-icons_dir="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+xdg_data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
+apps_dir="$xdg_data_home/applications"
+hicolor_dir="$xdg_data_home/icons/hicolor"
+icons_dir="$hicolor_dir/scalable/apps"
+exec_target="$HOME/.local/bin/clipflip"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --exec)
+      exec_target="${2:-}"
+      shift 2 ;;
+    --help)
+      usage; exit 0 ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1 ;;
+  esac
+done
+
+if [[ -z "$exec_target" ]]; then
+  echo "--exec requires a value." >&2
+  exit 1
+fi
+
+if [[ "$exec_target" == "$HOME/.local/bin/clipflip" && ! -x "$exec_target" ]]; then
+  exec_target="$project_dir/bin/clipflip"
+fi
+desktop_exec="$exec_target"
+if [[ "$desktop_exec" == */* ]]; then
+  desktop_exec="${desktop_exec//\\/\\\\}"
+  desktop_exec="${desktop_exec//\"/\\\"}"
+  desktop_exec="\"$desktop_exec\""
+fi
 
 mkdir -p "$apps_dir" "$icons_dir"
-cp "$project_dir/packaging/clipflip.desktop" "$apps_dir/clipflip.desktop"
-cp "$project_dir/assets/clipflip-logo.svg" "$icons_dir/clipflip.svg"
+awk -v exec_target="$desktop_exec" '
+  /^Exec=/ { print "Exec=" exec_target; next }
+  { print }
+' "$project_dir/packaging/clipflip.desktop" > "$apps_dir/clipflip.desktop"
+cp "$project_dir/assets/clipflip.svg" "$icons_dir/clipflip.svg"
+chmod 0644 "$apps_dir/clipflip.desktop" "$icons_dir/clipflip.svg"
 
-echo "Installed ClipFlip Studio desktop entry."
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database -q "$apps_dir" >/dev/null 2>&1 || true
+fi
+
+if command -v gtk-update-icon-cache >/dev/null 2>&1; then
+  gtk-update-icon-cache -q -t "$hicolor_dir" >/dev/null 2>&1 || true
+fi
+
+cat <<EOF
+Installed ClipFlip Studio desktop entry.
+  Desktop file: $apps_dir/clipflip.desktop
+  Icon file: $icons_dir/clipflip.svg
+  Launcher: $exec_target
+EOF
