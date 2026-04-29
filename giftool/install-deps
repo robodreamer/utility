@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage:
+  ./install-deps [options]
+
+Options:
+      --user       Install Python packages with pip --user (default)
+      --venv DIR   Create/use a virtualenv and install Python packages there
+      --system     Install system packages with apt-get before Python packages
+      --no-links   Do not create ~/.local/bin command links
+      --help       Show this help
+
+Examples:
+  ./install-deps
+  ./install-deps --system
+  ./install-deps --venv .venv
+EOF
+}
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+requirements="$script_dir/requirements.txt"
+install_mode="user"
+venv_dir=""
+install_system=""
+create_links="1"
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --user)
+      install_mode="user"; shift ;;
+    --venv)
+      install_mode="venv"
+      venv_dir="${2:-}"
+      shift 2 ;;
+    --system)
+      install_system="1"; shift ;;
+    --no-links)
+      create_links=""; shift ;;
+    --help)
+      usage; exit 0 ;;
+    *)
+      echo "Unknown argument: $1" >&2
+      usage >&2
+      exit 1 ;;
+  esac
+done
+
+if [[ "$install_mode" == "venv" && -z "$venv_dir" ]]; then
+  echo "--venv requires a directory." >&2
+  exit 1
+fi
+
+if [[ -n "$install_system" ]]; then
+  if ! command -v apt-get >/dev/null 2>&1; then
+    echo "--system currently supports apt-get based Linux systems." >&2
+    exit 1
+  fi
+  sudo apt-get update
+  sudo apt-get install -y ffmpeg python3-pip python3-venv python3-tk
+fi
+
+if ! command -v ffmpeg >/dev/null 2>&1; then
+  cat >&2 <<'EOF'
+ffmpeg was not found in PATH.
+
+Install it with your system package manager, or rerun this script with:
+  ./install-deps --system
+EOF
+  exit 1
+fi
+
+if ! command -v ffprobe >/dev/null 2>&1; then
+  echo "ffprobe was not found in PATH. It is usually installed with ffmpeg." >&2
+  exit 1
+fi
+
+if [[ "$install_mode" == "venv" ]]; then
+  python3 -m venv "$venv_dir"
+  "$venv_dir/bin/python" -m pip install --upgrade pip
+  "$venv_dir/bin/python" -m pip install -r "$requirements"
+  python_cmd="$venv_dir/bin/python"
+else
+  python3 -m pip install --user --upgrade pip
+  python3 -m pip install --user -r "$requirements"
+  python_cmd="python3"
+fi
+
+if [[ -n "$create_links" ]]; then
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$script_dir/bin/giftool" "$HOME/.local/bin/giftool"
+  ln -sf "$script_dir/bin/videotool" "$HOME/.local/bin/videotool"
+  ln -sf "$script_dir/bin/giftool-ui" "$HOME/.local/bin/giftool-ui"
+fi
+
+cat <<EOF
+Dependencies installed.
+
+Run the modern UI with:
+  giftool-ui
+
+Run the CLIs with:
+  giftool --help
+  videotool --help
+
+If giftool-ui is not found, add this to your shell profile:
+  export PATH="\$HOME/.local/bin:\$PATH"
+
+Python used for dependency checks:
+  $python_cmd
+EOF
