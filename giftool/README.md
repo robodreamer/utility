@@ -24,6 +24,7 @@ The current app supports:
 - GIF and video inputs, including `.gif`, `.mp4`, `.m4v`, `.mov`, and `.webm`.
 - start/end trimming with preview playback and trim-range looping.
 - GIF-to-MP4 and MP4-to-GIF conversion.
+- automatic even-dimension padding for H.264 MP4 output.
 - width, height, scale, and FPS controls.
 - subtitle-style MP4 text overlays.
 - side-by-side comparison renders with independent trim ranges and panel labels.

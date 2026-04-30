@@ -297,6 +297,8 @@ if [[ -n "$text" ]]; then
   vf_parts+=("$(caption_filter "$text" "$text_position" "$text_size")")
 fi
 
+vf_parts+=("pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1")
+
 ffmpeg_args=(-y)
 
 if [[ -n "$start" ]]; then
