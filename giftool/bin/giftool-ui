@@ -9,6 +9,7 @@ import os
 import re
 import secrets
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -313,6 +314,7 @@ class TrimTool:
         self.compare_scrub_time = 0.0
         self.output_format = "auto"
         self.rendering = False
+        self.loading = False
         self.syncing = False
         self.resize_syncing = False
         self.gif_play_task: asyncio.Task | None = None
@@ -331,6 +333,7 @@ class TrimTool:
         self.source_upload = None
         self.compare_upload = None
         self.output_input = None
+        self.save_copy_input = None
         self.status = None
         self.meta = None
         self.compare_meta = None
@@ -340,6 +343,7 @@ class TrimTool:
         self.render_button = None
         self.open_output_button = None
         self.download_button = None
+        self.save_copy_button = None
         self.source_video = None
         self.compare_video = None
         self.gif_frame_image = None
@@ -443,6 +447,24 @@ class TrimTool:
                   begin();
                 }
 
+                return true;
+              };
+
+              window.giftoolRecoverMedia = (videoId) => {
+                const component = getElement(videoId);
+                const video = component && component.$el;
+                if (!video) return false;
+                const now = Date.now();
+                const lastReload = Number(video.dataset.giftoolLastReload || 0);
+                if (now - lastReload < 1500) return false;
+                video.dataset.giftoolLastReload = String(now);
+                try {
+                  video.pause();
+                  video.currentTime = 0;
+                } catch (error) {
+                  console.warn("Preview reset failed", error);
+                }
+                video.load();
                 return true;
               };
             </script>
@@ -629,13 +651,29 @@ class TrimTool:
             ui.separator()
             self.output_input = ui.input("Output path").props("outlined dense").classes("w-full")
             with ui.row().classes("w-full gap-2"):
+                ui.button("Choose Output", icon="folder_open", on_click=self.choose_output_path).props(
+                    "outline"
+                ).classes("grow")
+                ui.button("Default Path", icon="drive_file_move", on_click=self.use_default_output_path).props(
+                    "outline"
+                ).classes("grow")
                 self.open_output_button = ui.button(
                     "ffplay", icon="play_circle", on_click=self.open_output_external
                 ).props("outline disabled").classes("grow")
                 self.download_button = ui.button(
-                    "Download", icon="download", on_click=self.download_output
+                    "Browser Download", icon="download", on_click=self.download_output
                 ).props("outline disabled").classes("grow")
             self.output_meta = ui.label("No output rendered.").classes("muted")
+            self.save_copy_input = ui.input("Save rendered copy to path").props("outlined dense clearable").classes(
+                "w-full"
+            )
+            with ui.row().classes("w-full gap-2"):
+                ui.button("Choose Path", icon="folder_open", on_click=self.choose_save_copy_path).props(
+                    "outline"
+                ).classes("grow")
+                self.save_copy_button = ui.button(
+                    "Save Copy", icon="save_as", on_click=self.save_output_copy
+                ).props("outline disabled").classes("grow")
 
     @ui.refreshable
     def preview_panel(self) -> None:
@@ -685,7 +723,14 @@ class TrimTool:
                     if self.output_path.suffix.lower() == ".gif":
                         self.gif_preview(self.output_path)
                     else:
-                        ui.video(self.output_path).props("controls preload=metadata muted").classes("media-view")
+                        output_video = ui.video(self.output_path).props("controls preload=metadata muted").classes(
+                            "media-view"
+                        )
+                        output_video.on(
+                            "error",
+                            self.on_output_media_error,
+                            js_handler=f"() => emit(window.giftoolRecoverMedia({output_video.id}))",
+                        )
 
     def gif_preview(self, path: Path) -> None:
         ui.element("img").props(f'src="{static_file_url(path)}"').classes("media-view")
@@ -694,7 +739,7 @@ class TrimTool:
         self.gif_preview_path = None
         self.gif_preview_frames = []
         self.gif_preview_frame_starts = []
-        preview_files = extract_gif_preview_files(info.path, info.duration)
+        preview_files = await asyncio.to_thread(extract_gif_preview_files, info.path, info.duration)
         self.gif_preview_frames = [
             GifPreviewFrame(item.start, item.end, item.path, static_file_url(item.path)) for item in preview_files
         ]
@@ -743,6 +788,11 @@ class TrimTool:
                         "media-view"
                     )
                     self.source_video.on(
+                        "error",
+                        self.on_source_media_error,
+                        js_handler=f"() => emit(window.giftoolRecoverMedia({self.source_video.id}))",
+                    )
+                    self.source_video.on(
                         "timeupdate",
                         self.on_preview_time_update,
                         js_handler="(event) => emit(event.target.currentTime)",
@@ -765,6 +815,11 @@ class TrimTool:
                 else:
                     self.compare_video = ui.video(compare_path).props("controls preload=metadata muted").classes(
                         "media-view"
+                    )
+                    self.compare_video.on(
+                        "error",
+                        self.on_compare_media_error,
+                        js_handler=f"() => emit(window.giftoolRecoverMedia({self.compare_video.id}))",
                     )
                     self.compare_video.on(
                         "timeupdate",
@@ -1176,6 +1231,28 @@ class TrimTool:
         if self.fps_input and self.info.fps:
             self.fps_input.set_value(f"{self.info.fps:.2f}".rstrip("0").rstrip("."))
 
+    def set_status(self, message: str) -> None:
+        if self.status:
+            self.status.set_text(message)
+
+    def set_loading_state(self, loading: bool, message: str | None = None) -> None:
+        self.loading = loading
+        if message:
+            self.set_status(message)
+        for control in (
+            self.source_upload,
+            self.compare_upload,
+            self.path_input,
+            self.compare_path_input,
+            self.render_button,
+        ):
+            if control is None:
+                continue
+            if loading:
+                control.disable()
+            else:
+                control.enable()
+
     def output_format_select_value(self) -> str:
         if self.side_by_side_active():
             return "mp4"
@@ -1234,6 +1311,9 @@ class TrimTool:
         return matched
 
     async def handle_upload(self, event: events.UploadEventArguments) -> None:
+        if self.loading:
+            ui.notify("Another file is still loading.", type="warning")
+            return
         filename = clean_filename(event.file.name)
         suffix = Path(filename).suffix.lower()
         if suffix not in ACCEPTED_SUFFIXES:
@@ -1241,10 +1321,19 @@ class TrimTool:
             return
 
         target = UPLOAD_DIR / f"{Path(filename).stem}-{secrets.token_hex(4)}{suffix}"
-        await event.file.save(target)
-        await self.load_media(target)
+        self.set_loading_state(True, f"Uploading {filename}...")
+        ui.notify(f"Uploading {filename}...", type="info")
+        await asyncio.sleep(0)
+        try:
+            await event.file.save(target)
+            await self.load_media(target)
+        finally:
+            self.set_loading_state(False)
 
     async def handle_compare_upload(self, event: events.UploadEventArguments) -> None:
+        if self.loading:
+            ui.notify("Another file is still loading.", type="warning")
+            return
         filename = clean_filename(event.file.name)
         suffix = Path(filename).suffix.lower()
         if suffix not in ACCEPTED_SUFFIXES:
@@ -1252,10 +1341,19 @@ class TrimTool:
             return
 
         target = UPLOAD_DIR / f"{Path(filename).stem}-{secrets.token_hex(4)}{suffix}"
-        await event.file.save(target)
-        await self.load_compare_media(target)
+        self.set_loading_state(True, f"Uploading {filename}...")
+        ui.notify(f"Uploading {filename}...", type="info")
+        await asyncio.sleep(0)
+        try:
+            await event.file.save(target)
+            await self.load_compare_media(target)
+        finally:
+            self.set_loading_state(False)
 
     async def load_path(self) -> None:
+        if self.loading:
+            ui.notify("Another file is still loading.", type="warning")
+            return
         raw_path = (self.path_input.value or "").strip() if self.path_input else ""
         if not raw_path:
             ui.notify("Enter a local media path.", type="warning")
@@ -1264,6 +1362,9 @@ class TrimTool:
         await self.load_media(path)
 
     async def load_compare_path(self) -> None:
+        if self.loading:
+            ui.notify("Another file is still loading.", type="warning")
+            return
         raw_path = (self.compare_path_input.value or "").strip() if self.compare_path_input else ""
         if not raw_path:
             ui.notify("Enter a second media path.", type="warning")
@@ -1272,95 +1373,156 @@ class TrimTool:
 
     async def load_media(self, path: Path) -> None:
         path = path.expanduser()
+        managed_loading = not self.loading
+        if managed_loading:
+            self.set_loading_state(True, f"Loading {path.name}...")
+        else:
+            self.set_status(f"Loading {path.name}...")
+        await asyncio.sleep(0)
         if not path.exists() or not path.is_file():
             ui.notify("Source file was not found.", type="negative")
+            if managed_loading:
+                self.set_loading_state(False, "Source file was not found.")
             return
         self.stop_gif_playback()
         try:
-            info = probe_media(path)
+            self.set_status(f"Reading metadata for {path.name}...")
+            info = await asyncio.to_thread(probe_media, path)
         except Exception as exc:
             ui.notify(f"Could not read media: {exc}", type="negative")
+            if managed_loading:
+                self.set_loading_state(False, "Could not read media.")
             return
 
-        self.info = info
-        self.output_path = None
-        self.compare_enabled = self.compare_info is not None
-        self.output_format = "auto"
-        self.start_time = 0.0
-        self.end_time = info.duration if info.duration > 0 else 1.0
-        self.scrub_time = 0.0
-        self.pending_scrub_updates.clear()
-        self.gif_video_preview_path = None
-        self.gif_preview_path = None
-        self.gif_preview_frames = []
-        self.gif_preview_frame_starts = []
-        if info.kind == "gif":
-            if self.status:
-                self.status.set_text("Preparing GIF preview...")
+        try:
+            self.info = info
+            self.output_path = None
+            self.compare_enabled = self.compare_info is not None
+            self.output_format = "auto"
+            self.start_time = 0.0
+            self.end_time = info.duration if info.duration > 0 else 1.0
+            self.scrub_time = 0.0
+            self.pending_scrub_updates.clear()
+            self.gif_video_preview_path = None
+            self.gif_preview_path = None
+            self.gif_preview_frames = []
+            self.gif_preview_frame_starts = []
+            if info.kind == "gif":
+                self.set_status(f"Preparing preview for {info.path.name}...")
                 await asyncio.sleep(0)
-            try:
-                self.gif_video_preview_path = ensure_gif_video_preview(info.path)
-            except Exception as exc:
-                ui.notify(f"Could not prepare video preview; using frame preview: {exc}", type="warning")
                 try:
-                    await self.prepare_gif_preview(info)
-                except Exception as frame_exc:
-                    ui.notify(f"Could not prepare GIF frame preview: {frame_exc}", type="negative")
-        if self.path_input:
-            self.path_input.set_value(str(info.path))
-        if self.output_input:
-            self.output_input.set_value(str(self.default_output_path(info)))
-        if self.output_meta:
-            self.output_meta.set_text("No output rendered.")
-        self.set_output_buttons(False)
-        self.refresh_meta()
-        self.preview_panel.refresh()
-        self.controls_panel.refresh()
-        ui.notify(f"Loaded {info.path.name}", type="positive")
+                    self.gif_video_preview_path = await asyncio.to_thread(ensure_gif_video_preview, info.path)
+                except Exception as exc:
+                    ui.notify(f"Could not prepare video preview; using frame preview: {exc}", type="warning")
+                    try:
+                        await self.prepare_gif_preview(info)
+                    except Exception as frame_exc:
+                        ui.notify(f"Could not prepare GIF frame preview: {frame_exc}", type="negative")
+            if self.path_input:
+                self.path_input.set_value(str(info.path))
+            if self.output_input:
+                self.output_input.set_value(str(self.default_output_path(info)))
+            if self.save_copy_input:
+                self.save_copy_input.set_value("")
+            if self.output_meta:
+                self.output_meta.set_text("No output rendered.")
+            self.set_output_buttons(False)
+            self.refresh_meta()
+            self.preview_panel.refresh()
+            self.controls_panel.refresh()
+            self.set_status(f"Loaded {info.path.name}.")
+            ui.notify(f"Loaded {info.path.name}", type="positive")
+        finally:
+            if managed_loading:
+                self.set_loading_state(False)
 
     async def load_compare_media(self, path: Path) -> None:
         path = path.expanduser()
+        managed_loading = not self.loading
+        if managed_loading:
+            self.set_loading_state(True, f"Loading comparison {path.name}...")
+        else:
+            self.set_status(f"Loading comparison {path.name}...")
+        await asyncio.sleep(0)
         if not path.exists() or not path.is_file():
             ui.notify("Comparison file was not found.", type="negative")
+            if managed_loading:
+                self.set_loading_state(False, "Comparison file was not found.")
             return
         try:
-            info = probe_media(path)
+            self.set_status(f"Reading metadata for {path.name}...")
+            info = await asyncio.to_thread(probe_media, path)
         except Exception as exc:
             ui.notify(f"Could not read comparison media: {exc}", type="negative")
+            if managed_loading:
+                self.set_loading_state(False, "Could not read comparison media.")
             return
 
-        self.compare_info = info
-        self.compare_video_preview_path = None
-        if info.kind == "gif":
-            if self.status:
-                self.status.set_text("Preparing comparison GIF preview...")
+        try:
+            self.compare_info = info
+            self.compare_video_preview_path = None
+            if info.kind == "gif":
+                self.set_status(f"Preparing comparison preview for {info.path.name}...")
                 await asyncio.sleep(0)
-            try:
-                self.compare_video_preview_path = ensure_gif_video_preview(info.path)
-            except Exception as exc:
-                ui.notify(f"Could not prepare comparison GIF video preview: {exc}", type="warning")
-        self.compare_enabled = self.info is not None
-        self.compare_start_time = 0.0
-        self.compare_end_time = info.duration if info.duration > 0 else 1.0
-        self.compare_scrub_time = 0.0
-        self.pending_compare_scrub_updates.clear()
-        if self.compare_path_input:
-            self.compare_path_input.set_value(str(info.path))
-        if self.output_input and self.info is not None:
-            self.output_input.set_value(str(self.default_output_path(self.info)))
-        self.refresh_compare_meta()
-        self.preview_panel.refresh()
-        self.controls_panel.refresh()
-        ui.notify(f"Loaded comparison media {info.path.name}", type="positive")
+                try:
+                    self.compare_video_preview_path = await asyncio.to_thread(ensure_gif_video_preview, info.path)
+                except Exception as exc:
+                    ui.notify(f"Could not prepare comparison GIF video preview: {exc}", type="warning")
+            self.compare_enabled = self.info is not None
+            self.compare_start_time = 0.0
+            self.compare_end_time = info.duration if info.duration > 0 else 1.0
+            self.compare_scrub_time = 0.0
+            self.pending_compare_scrub_updates.clear()
+            if self.compare_path_input:
+                self.compare_path_input.set_value(str(info.path))
+            if self.output_input and self.info is not None:
+                self.output_input.set_value(str(self.default_output_path(self.info)))
+            if self.save_copy_input:
+                self.save_copy_input.set_value("")
+            self.refresh_compare_meta()
+            self.preview_panel.refresh()
+            self.controls_panel.refresh()
+            self.set_status(f"Loaded comparison media {info.path.name}.")
+            ui.notify(f"Loaded comparison media {info.path.name}", type="positive")
+        finally:
+            if managed_loading:
+                self.set_loading_state(False)
 
     def default_output_path(self, info: MediaInfo) -> Path:
+        output_dir = self.default_output_dir(info)
         if self.compare_info is not None and self.compare_enabled:
-            return OUTPUT_DIR / f"{info.path.stem}-vs-{self.compare_info.path.stem}.mp4"
+            return output_dir / f"{info.path.stem}-vs-{self.compare_info.path.stem}.mp4"
         suffix = ".gif" if self.target_output_kind() == "gif" else ".mp4"
-        return OUTPUT_DIR / f"{info.path.stem}-trimmed{suffix}"
+        return output_dir / f"{info.path.stem}-trimmed{suffix}"
+
+    def default_output_dir(self, info: MediaInfo) -> Path:
+        env_dir = os.environ.get("GIFTOOL_UI_OUTPUT_DIR")
+        if env_dir:
+            return Path(env_dir).expanduser()
+        try:
+            info.path.resolve().relative_to(UPLOAD_DIR.resolve())
+        except ValueError:
+            return info.path.parent
+        videos_dir = Path.home() / "Videos" / "ClipFlip"
+        return videos_dir if (Path.home() / "Videos").exists() else Path.home() / "ClipFlip"
+
+    def use_default_output_path(self) -> None:
+        if self.info is None:
+            ui.notify("Load a GIF or video first.", type="warning")
+            return
+        if self.output_input:
+            self.output_input.set_value(str(self.default_output_path(self.info)))
+
+    def choose_output_path(self) -> None:
+        if self.info is None:
+            ui.notify("Load a GIF or video first.", type="warning")
+            return
+        selected = self.ask_save_path(self.default_output_path(self.info))
+        if selected and self.output_input:
+            self.output_input.set_value(selected)
 
     def set_output_buttons(self, enabled: bool) -> None:
-        for button in (self.open_output_button, self.download_button):
+        for button in (self.open_output_button, self.download_button, self.save_copy_button):
             if button is None:
                 continue
             if enabled:
@@ -1484,6 +1646,30 @@ class TrimTool:
         scrub_min, scrub_max = self.scrub_bounds()
         self.scrub_time = max(scrub_min, min(parse_number(raw_value, self.scrub_time), scrub_max))
         self.sync_scrub_controls()
+
+    def on_source_media_error(self, event: events.GenericEventArguments) -> None:
+        recovered = bool(event.args[0] if isinstance(event.args, list) and event.args else event.args)
+        if recovered:
+            self.set_status("Preview media had an error; reloading source preview.")
+            ui.notify("Reloading source preview.", type="warning")
+        else:
+            self.set_status("Preview media could not reload automatically.")
+
+    def on_compare_media_error(self, event: events.GenericEventArguments) -> None:
+        recovered = bool(event.args[0] if isinstance(event.args, list) and event.args else event.args)
+        if recovered:
+            self.set_status("Comparison preview had an error; reloading preview.")
+            ui.notify("Reloading comparison preview.", type="warning")
+        else:
+            self.set_status("Comparison preview could not reload automatically.")
+
+    def on_output_media_error(self, event: events.GenericEventArguments) -> None:
+        recovered = bool(event.args[0] if isinstance(event.args, list) and event.args else event.args)
+        if recovered:
+            self.set_status("Rendered preview had an error; reloading output preview.")
+            ui.notify("Reloading output preview.", type="warning")
+        else:
+            self.set_status("Rendered preview could not reload automatically.")
 
     def full_range(self) -> None:
         if self.info is None:
@@ -1857,6 +2043,8 @@ class TrimTool:
             self.compare_path_input.set_value("")
         if self.output_input:
             self.output_input.set_value("")
+        if self.save_copy_input:
+            self.save_copy_input.set_value("")
         if self.output_meta:
             self.output_meta.set_text("No output rendered.")
         self.set_output_buttons(False)
@@ -1996,7 +2184,9 @@ class TrimTool:
             self.output_input.set_value(str(output_path))
         if self.output_meta:
             size_mb = output_path.stat().st_size / (1024 * 1024)
-            self.output_meta.set_text(f"Rendered {output_path.name} ({size_mb:.2f} MB)")
+            self.output_meta.set_text(f"Rendered {output_path} ({size_mb:.2f} MB)")
+        if self.save_copy_input:
+            self.save_copy_input.set_value(str(output_path))
         if self.status:
             self.status.set_text("Render complete.")
         self.set_output_buttons(True)
@@ -2022,6 +2212,76 @@ class TrimTool:
             return
         ui.download(str(self.output_path), filename=self.output_path.name)
 
+    def ask_save_path(self, initial_path: Path) -> str:
+        try:
+            import tkinter as tk
+            from tkinter import filedialog
+
+            root = tk.Tk()
+            root.withdraw()
+            root.attributes("-topmost", True)
+            selected = filedialog.asksaveasfilename(
+                initialdir=str(initial_path.parent),
+                initialfile=initial_path.name,
+                defaultextension=initial_path.suffix,
+                filetypes=[
+                    ("Media file", f"*{initial_path.suffix}" if initial_path.suffix else "*"),
+                    ("All files", "*"),
+                ],
+            )
+            root.destroy()
+        except Exception as exc:
+            ui.notify(f"Could not open save dialog: {exc}", type="negative")
+            return ""
+
+        return selected or ""
+
+    def choose_save_copy_path(self) -> None:
+        initial_path = self.output_path
+        if initial_path is None and self.info is not None:
+            initial_path = self.default_output_path(self.info)
+        if initial_path is None:
+            ui.notify("Load or render media before choosing a save path.", type="warning")
+            return
+
+        selected = self.ask_save_path(initial_path)
+        if selected and self.save_copy_input:
+            self.save_copy_input.set_value(selected)
+
+    async def save_output_copy(self) -> None:
+        if self.output_path is None or not self.output_path.exists():
+            ui.notify("Render an output first.", type="warning")
+            return
+        raw_target = (self.save_copy_input.value or "").strip() if self.save_copy_input else ""
+        if not raw_target:
+            ui.notify("Enter a destination path for the rendered copy.", type="warning")
+            return
+
+        target = Path(raw_target).expanduser()
+        if target.exists() and target.is_dir():
+            target = target / self.output_path.name
+        if not target.suffix:
+            target = target.with_suffix(self.output_path.suffix)
+        if target == self.output_path:
+            ui.notify("The rendered file is already at that path.", type="info")
+            return
+
+        try:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(shutil.copy2, self.output_path, target)
+        except Exception as exc:
+            ui.notify(f"Could not save copy: {exc}", type="negative")
+            self.set_status("Save copy failed.")
+            return
+
+        if self.save_copy_input:
+            self.save_copy_input.set_value(str(target))
+        size_mb = target.stat().st_size / (1024 * 1024)
+        if self.output_meta:
+            self.output_meta.set_text(f"Saved copy to {target} ({size_mb:.2f} MB)")
+        self.set_status(f"Saved copy to {target}.")
+        ui.notify(f"Saved copy to {target}", type="positive")
+
 
 def main() -> None:
     args = parse_args(sys.argv[1:])
@@ -2044,12 +2304,15 @@ def main() -> None:
     port = args.port
     if port is None and not args.native:
         port = 8080
+    window_size = args.window_size
+    if args.native and window_size is None:
+        window_size = (1440, 960)
     ui.run(
         title="ClipFlip Studio",
         host=args.host,
         port=port,
         native=args.native,
-        window_size=args.window_size,
+        window_size=window_size,
         fullscreen=args.fullscreen,
         frameless=args.frameless,
         reload=False,
