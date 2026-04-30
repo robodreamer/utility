@@ -25,6 +25,8 @@ The current app supports:
 - start/end trimming with preview playback and trim-range looping.
 - GIF-to-MP4 and MP4-to-GIF conversion.
 - automatic even-dimension padding for H.264 MP4 output.
+- visible loading/rendering status while media is being probed or preview files are being prepared.
+- editable output paths plus server-side save-copy support for placing rendered files outside the app cache.
 - width, height, scale, and FPS controls.
 - subtitle-style MP4 text overlays.
 - side-by-side comparison renders with independent trim ranges and panel labels.
@@ -102,15 +104,20 @@ clipflip --native --window-size 1280x900
 giftool-ui --host 127.0.0.1 --port 8080
 ```
 
+Native mode defaults to a `1440x960` window. Override it with `--window-size` or `GIFTOOL_UI_WINDOW_SIZE`.
+
 Useful environment overrides:
 
 ```bash
 GIFTOOL_UI_PORT=8090 clipflip
 GIFTOOL_UI_CACHE=/tmp/giftool-ui-cache clipflip
+GIFTOOL_UI_OUTPUT_DIR="$HOME/Videos/ClipFlip" clipflip
 GIFTOOL_UI_SHOW=0 clipflip
 GIFTOOL_UI_NATIVE=1 clipflip
 GIFTOOL_UI_WINDOW_SIZE=1280x900 clipflip --native
 ```
+
+By default, renders from a typed local path are written next to the source file. Renders from browser-uploaded files are written to `~/Videos/ClipFlip` when `~/Videos` exists, or `~/ClipFlip` otherwise. Use `Choose Output` or the output path field before rendering, or `Choose Path` and `Save Copy` after rendering, to place the result elsewhere.
 
 ## CLI Examples
 
