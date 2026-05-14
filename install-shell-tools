@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: install-shell-tools [--bashrc PATH] [--utility-home PATH]
+
+Install this utility workspace's shell setup into a Bash startup file.
+
+Options:
+  --bashrc PATH        Bash startup file to update. Default: ~/.bashrc
+  --utility-home PATH  Utility workspace path. Default: this script's directory
+  -h, --help           Show this help.
+EOF
+}
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+bashrc="${HOME}/.bashrc"
+utility_home="$script_dir"
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --bashrc)
+      bashrc="${2:?missing path for --bashrc}"
+      shift 2
+      ;;
+    --utility-home)
+      utility_home="${2:?missing path for --utility-home}"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+begin_marker="# >>> utility workspace shell tools >>>"
+end_marker="# <<< utility workspace shell tools <<<"
+tmp_file="$(mktemp)"
+trap 'rm -f "$tmp_file"' EXIT
+
+mkdir -p "$(dirname -- "$bashrc")"
+touch "$bashrc"
+
+awk -v begin="$begin_marker" -v end="$end_marker" '
+  $0 == begin { skipping = 1; next }
+  $0 == end { skipping = 0; next }
+  !skipping { print }
+' "$bashrc" > "$tmp_file"
+
+cat >> "$tmp_file" <<EOF
+
+$begin_marker
+# Managed by $utility_home/install-shell-tools
+UTILITY_HOME="$utility_home"
+for utility_bin in \\
+  "\$UTILITY_HOME/git-park/bin" \\
+  "\$UTILITY_HOME/git-recent/bin" \\
+  "\$UTILITY_HOME/giftool/bin"
+do
+  if [ -d "\$utility_bin" ] && [[ ":\$PATH:" != *":\$utility_bin:"* ]]; then
+    export PATH="\$utility_bin:\$PATH"
+  fi
+done
+unset utility_bin
+
+alias gpark='git park'
+alias parkcd='cd "\$(git park go)"'
+alias parkhome='cd "\$(git park home)"'
+alias pgp='park go --pick'
+
+park() {
+  case "\${1:-}" in
+    home)
+      shift
+      cd "\$(git park home "\$@")" || return
+      ;;
+    go)
+      shift
+      cd "\$(git park go "\$@")" || return
+      ;;
+    *)
+      git park "\$@"
+      ;;
+  esac
+}
+
+grecent() {
+  local target
+  target="\$(git recent "\$@")" || return
+  if [ -n "\$target" ] && [ -d "\$target" ]; then
+    cd "\$target" || return
+  elif [ -n "\$target" ]; then
+    printf '%s\n' "\$target"
+  fi
+}
+$end_marker
+EOF
+
+mv "$tmp_file" "$bashrc"
+trap - EXIT
+
+printf 'Installed utility shell tools in %s\n' "$bashrc"
+printf 'Reload with: source %s\n' "$bashrc"

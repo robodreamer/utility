@@ -17,6 +17,23 @@ Personal utility tools live in dedicated subdirectories so new tools can be adde
 
 ## PATH
 
+Install optional dependencies first:
+
+```bash
+./install-deps
+```
+
+This installs `fzf` when it is missing, which enables arrow-key selection in `git park` and `git recent` menus. Use `./install-deps --check` to only report dependency status, or `./install-deps --dry-run` to print the install command.
+
+Install or refresh the shell setup automatically:
+
+```bash
+./install-shell-tools
+source ~/.bashrc
+```
+
+The installer adds a managed block to `~/.bashrc` for `git park`, `git recent`, and ClipFlip/GIF tools. It is safe to rerun; the managed block is replaced instead of duplicated.
+
 Add tool bins to your shell config (Bash example):
 
 ```bash

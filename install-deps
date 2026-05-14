@@ -1,0 +1,98 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: install-deps [--check] [--dry-run]
+
+Install optional dependencies for the utility workspace.
+
+Options:
+  --check    Report dependency status without installing.
+  --dry-run  Print the install command that would run.
+  -h, --help Show this help.
+EOF
+}
+
+check_only=0
+dry_run=0
+
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --check)
+      check_only=1
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'Unknown option: %s\n\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+if command -v fzf >/dev/null 2>&1; then
+  printf 'fzf already installed: %s\n' "$(command -v fzf)"
+  exit 0
+fi
+
+if [ "$check_only" -eq 1 ]; then
+  printf 'fzf is not installed.\n'
+  exit 1
+fi
+
+install_cmd=()
+install_cmd_after=()
+if command -v apt-get >/dev/null 2>&1; then
+  install_cmd=(sudo apt-get update)
+  install_cmd_after=(sudo apt-get install -y fzf)
+elif command -v dnf >/dev/null 2>&1; then
+  install_cmd=(sudo dnf install -y fzf)
+elif command -v pacman >/dev/null 2>&1; then
+  install_cmd=(sudo pacman -S --needed fzf)
+elif command -v apk >/dev/null 2>&1; then
+  install_cmd=(sudo apk add fzf)
+elif command -v brew >/dev/null 2>&1; then
+  install_cmd=(brew install fzf)
+elif command -v conda >/dev/null 2>&1; then
+  install_cmd=(conda install -c conda-forge fzf)
+elif command -v nix-env >/dev/null 2>&1; then
+  install_cmd=(nix-env -iA nixpkgs.fzf)
+else
+  cat >&2 <<'EOF'
+Could not find a supported package manager to install fzf.
+
+Install fzf manually from:
+  https://github.com/junegunn/fzf
+EOF
+  exit 1
+fi
+
+printf 'Install command:'
+printf ' %q' "${install_cmd[@]}"
+if [ "${#install_cmd_after[@]}" -gt 0 ]; then
+  printf ' &&'
+  printf ' %q' "${install_cmd_after[@]}"
+fi
+printf '\n'
+
+if [ "$dry_run" -eq 1 ]; then
+  exit 0
+fi
+
+if [ "${#install_cmd_after[@]}" -gt 0 ]; then
+  "${install_cmd[@]}"
+  "${install_cmd_after[@]}"
+else
+  "${install_cmd[@]}"
+fi
+
+printf 'fzf installed: %s\n' "$(command -v fzf)"
