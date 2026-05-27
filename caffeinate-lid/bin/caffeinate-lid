@@ -1,0 +1,130 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+STATE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/caffeinate-lid"
+PID_FILE="$STATE_DIR/pid"
+LOG_FILE="$STATE_DIR/log"
+INHIBIT_WHAT="sleep:idle:handle-lid-switch"
+INHIBIT_WHY="caffeinate-lid mode is enabled"
+
+mkdir -p "$STATE_DIR"
+
+usage() {
+  cat <<'EOF'
+Usage: caffeinate-lid <on|off|status|restart>
+
+Keep a Linux/systemd machine awake, including when the laptop lid is closed.
+
+Commands:
+  on       Block sleep, idle suspend, and lid-close suspend.
+  off      Disable caffeinated mode.
+  status   Show whether caffeinated mode is active.
+  restart  Disable and re-enable caffeinated mode.
+  help     Show this help.
+EOF
+}
+
+require_systemd_inhibit() {
+  if ! command -v systemd-inhibit >/dev/null 2>&1; then
+    echo "systemd-inhibit was not found. This tool requires Linux with systemd." >&2
+    exit 1
+  fi
+}
+
+read_pid() {
+  if [[ -f "$PID_FILE" ]]; then
+    cat "$PID_FILE"
+  fi
+}
+
+is_running() {
+  local pid="${1:-}"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+start() {
+  local pid
+  require_systemd_inhibit
+  pid="$(read_pid || true)"
+
+  if is_running "$pid"; then
+    echo "caffeinate-lid is already on (pid $pid)."
+    return 0
+  fi
+
+  rm -f "$PID_FILE"
+  nohup systemd-inhibit \
+    --what="$INHIBIT_WHAT" \
+    --mode=block \
+    --why="$INHIBIT_WHY" \
+    sleep infinity >>"$LOG_FILE" 2>&1 &
+
+  pid="$!"
+  echo "$pid" >"$PID_FILE"
+  disown "$pid" 2>/dev/null || true
+
+  sleep 0.2
+  if is_running "$pid"; then
+    echo "caffeinate-lid is on (pid $pid)."
+    echo "Sleep, idle suspend, and lid-close suspend are blocked."
+  else
+    echo "Failed to enable caffeinate-lid. See: $LOG_FILE" >&2
+    rm -f "$PID_FILE"
+    return 1
+  fi
+}
+
+stop() {
+  local pid
+  pid="$(read_pid || true)"
+
+  if ! is_running "$pid"; then
+    rm -f "$PID_FILE"
+    echo "caffeinate-lid is already off."
+    return 0
+  fi
+
+  kill "$pid"
+  rm -f "$PID_FILE"
+  echo "caffeinate-lid is off."
+}
+
+status() {
+  local pid
+  pid="$(read_pid || true)"
+
+  if ! is_running "$pid"; then
+    rm -f "$PID_FILE"
+    echo "caffeinate-lid is off."
+    return 0
+  fi
+
+  echo "caffeinate-lid is on (pid $pid)."
+  if command -v systemd-inhibit >/dev/null 2>&1; then
+    systemd-inhibit --list --no-pager 2>/dev/null | grep -E 'caffeinate-lid|sleep infinity|handle-lid-switch' || true
+  fi
+}
+
+case "${1:-}" in
+  on)
+    start
+    ;;
+  off)
+    stop
+    ;;
+  status)
+    status
+    ;;
+  restart)
+    stop
+    start
+    ;;
+  -h|--help|help|"")
+    usage
+    ;;
+  *)
+    echo "Unknown command: $1" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

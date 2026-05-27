@@ -62,7 +62,8 @@ UTILITY_HOME="$utility_home"
 for utility_bin in \\
   "\$UTILITY_HOME/git-park/bin" \\
   "\$UTILITY_HOME/git-recent/bin" \\
-  "\$UTILITY_HOME/giftool/bin"
+  "\$UTILITY_HOME/giftool/bin" \\
+  "\$UTILITY_HOME/caffeinate-lid/bin"
 do
   if [ -d "\$utility_bin" ] && [[ ":\$PATH:" != *":\$utility_bin:"* ]]; then
     export PATH="\$utility_bin:\$PATH"

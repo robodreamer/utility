@@ -14,6 +14,9 @@ Personal utility tools live in dedicated subdirectories so new tools can be adde
 - `git-recent/`
   - `bin/git-recent`: executable on your `PATH`
   - `README.md`: recently used branch picker
+- `caffeinate-lid/`
+  - `bin/caffeinate-lid`: keep a Linux/systemd laptop awake, including with the lid closed
+  - `README.md`: usage and setup
 
 ## PATH
 
@@ -32,13 +35,14 @@ Install or refresh the shell setup automatically:
 source ~/.bashrc
 ```
 
-The installer adds a managed block to `~/.bashrc` for `git park`, `git recent`, and ClipFlip/GIF tools. It is safe to rerun; the managed block is replaced instead of duplicated.
+The installer adds a managed block to `~/.bashrc` for `git park`, `git recent`, ClipFlip/GIF tools, and `caffeinate-lid`. It is safe to rerun; the managed block is replaced instead of duplicated.
 
 Add tool bins to your shell config (Bash example):
 
 ```bash
 export PATH="$HOME/utility/git-park/bin:$HOME/utility/git-recent/bin:$PATH"
 export PATH="$HOME/utility/giftool/bin:$PATH"
+export PATH="$HOME/utility/caffeinate-lid/bin:$PATH"
 ```
 
 Then reload:
