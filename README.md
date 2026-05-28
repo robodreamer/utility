@@ -17,6 +17,9 @@ Personal utility tools live in dedicated subdirectories so new tools can be adde
 - `caffeinate-lid/`
   - `bin/caffeinate-lid`: keep a Linux/systemd laptop awake, including with the lid closed
   - `README.md`: usage and setup
+- `agent-pick/`
+  - `bin/agent-pick`: interactive picker for Cursor vs Grok agent CLIs
+  - `README.md`: usage and shell setup
 
 ## PATH
 
@@ -35,7 +38,7 @@ Install or refresh the shell setup automatically:
 source ~/.bashrc
 ```
 
-The installer adds a managed block to `~/.bashrc` for `git park`, `git recent`, ClipFlip/GIF tools, and `caffeinate-lid`. It is safe to rerun; the managed block is replaced instead of duplicated.
+The installer adds a managed block to `~/.bashrc` for `git park`, `git recent`, ClipFlip/GIF tools, `caffeinate-lid`, and `agent-pick`. It is safe to rerun; the managed block is replaced instead of duplicated.
 
 Add tool bins to your shell config (Bash example):
 

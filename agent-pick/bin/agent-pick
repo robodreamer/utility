@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# Dispatch `agent` to Cursor or Grok CLI via an interactive picker (fzf or numbered menu).
+set -euo pipefail
+
+CURSOR_BIN="${AGENT_PICK_CURSOR_BIN:-${HOME}/.local/bin/cursor-agent}"
+GROK_BIN="${AGENT_PICK_GROK_BIN:-${HOME}/.grok/bin/grok}"
+STATE_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/agent-pick"
+DEFAULT_FILE="${STATE_DIR}/default"
+
+die() { echo "agent-pick: $*" >&2; exit 1; }
+
+have_tty() { [[ -t 0 || -t 1 || -t 2 ]] && [[ -r /dev/tty ]]; }
+
+have_fzf() { command -v fzf >/dev/null 2>&1; }
+
+usage() {
+  cat <<'EOF'
+agent-pick — choose and run an AI agent CLI
+
+Usage:
+  agent-pick [OPTIONS] [ARGS...]     pick (if needed), then run the selected CLI
+  agent-pick --pick [ARGS...]        always show the picker
+  agent-pick --cursor [ARGS...]      run Cursor Agent CLI
+  agent-pick --grok [ARGS...]        run Grok Build TUI
+
+When two or more CLIs are installed, `agent` / `agent-pick` show a picker before
+running (like `pgp` for git-park). With only one installed CLI, it runs directly.
+Set AGENT_PICK_DEFAULT or ~/.config/agent-pick/default to skip the picker.
+
+Options:
+  --pick       Force the interactive picker
+  --cursor     Skip picker; use Cursor Agent CLI
+  --grok       Skip picker; use Grok CLI
+  --list       Print installed backends (id<TAB>label<TAB>path)
+  -h, --help   Show this help
+
+Shell setup (via install-shell-tools):
+  agent          interactive dispatch (picker when multiple CLIs)
+  agp            alias for agent-pick --pick
+  cursor-agent   direct Cursor CLI
+  grok-agent     direct Grok CLI
+
+Environment:
+  AGENT_PICK_CURSOR_BIN   Override Cursor binary path
+  AGENT_PICK_GROK_BIN     Override Grok binary path
+  AGENT_PICK_DEFAULT      Default backend id (cursor|grok), skips picker when set
+EOF
+}
+
+# Pick one line from arguments; prints selection to stdout. Returns 1 on cancel / empty.
+pick_from_strings() {
+  local header="$1"
+  shift
+  [[ $# -gt 0 ]] || return 1
+  if have_fzf && have_tty; then
+    printf '%s\n' "$@" | fzf \
+      --height=10 \
+      --layout=reverse \
+      --border=rounded \
+      --header="$header" \
+      --prompt="> "
+  else
+    echo "" >&2
+    echo "agent-pick: $header" >&2
+    echo "(Install fzf for arrow-key selection: https://github.com/junegunn/fzf)" >&2
+    echo "" >&2
+    local i=1 opt
+    for opt in "$@"; do
+      echo "  $i) $opt" >&2
+      ((i++)) || true
+    done
+    echo "  0) Cancel" >&2
+    local n
+    have_tty || { echo "agent-pick: interactive selection needs a terminal" >&2; return 1; }
+    read -r -p "Enter number [0=cancel]: " n </dev/tty || return 1
+    [[ -n "${n:-}" ]] || return 1
+    [[ "$n" == "0" ]] && return 1
+    if [[ "$n" =~ ^[0-9]+$ ]] && (( n >= 1 && n <= $# )); then
+      eval "printf '%s\n' \"\${$n}\""
+    else
+      echo "agent-pick: invalid selection" >&2
+      return 1
+    fi
+  fi
+}
+
+# BACKEND_IDS BACKEND_LABELS BACKEND_BINS (parallel arrays)
+BACKEND_IDS=()
+BACKEND_LABELS=()
+BACKEND_BINS=()
+
+discover_backends() {
+  BACKEND_IDS=()
+  BACKEND_LABELS=()
+  BACKEND_BINS=()
+  if [[ -x "$CURSOR_BIN" ]]; then
+    BACKEND_IDS+=("cursor")
+    BACKEND_LABELS+=("Cursor Agent CLI")
+    BACKEND_BINS+=("$CURSOR_BIN")
+  fi
+  if [[ -x "$GROK_BIN" ]]; then
+    BACKEND_IDS+=("grok")
+    BACKEND_LABELS+=("Grok Build TUI")
+    BACKEND_BINS+=("$GROK_BIN")
+  fi
+}
+
+backend_index_for_id() {
+  local want="$1"
+  local i
+  for i in "${!BACKEND_IDS[@]}"; do
+    if [[ "${BACKEND_IDS[$i]}" == "$want" ]]; then
+      printf '%s\n' "$i"
+      return 0
+    fi
+  done
+  return 1
+}
+
+pick_backend_id() {
+  local header="$1"
+  local -a options=()
+  local i pick_line pick_id
+  for i in "${!BACKEND_LABELS[@]}"; do
+    options+=("${BACKEND_IDS[$i]}	${BACKEND_LABELS[$i]}")
+  done
+  pick_line="$(pick_from_strings "$header" "${options[@]}")" || return 1
+  pick_id="${pick_line%%$'\t'*}"
+  pick_id="${pick_id%%	*}"
+  [[ -n "$pick_id" ]] || return 1
+  printf '%s\n' "$pick_id"
+}
+
+read_default_backend() {
+  local from_env="${AGENT_PICK_DEFAULT:-}"
+  if [[ -n "$from_env" ]]; then
+    printf '%s\n' "$from_env"
+    return 0
+  fi
+  if [[ -f "$DEFAULT_FILE" ]]; then
+    sed -n '1p' "$DEFAULT_FILE" | tr -d '[:space:]'
+    return 0
+  fi
+  return 1
+}
+
+run_backend() {
+  local id="$1"
+  shift
+  local idx bin
+  idx="$(backend_index_for_id "$id")" || die "unknown backend: $id (try: agent-pick --list)"
+  bin="${BACKEND_BINS[$idx]}"
+  exec "$bin" "$@"
+}
+
+main() {
+  local force_pick=0
+  local backend=""
+  local list_only=0
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --pick) force_pick=1; shift ;;
+      --cursor) backend="cursor"; shift ;;
+      --grok) backend="grok"; shift ;;
+      --list) list_only=1; shift ;;
+      -h|--help)
+        if [[ -z "$backend" ]] && [[ "$force_pick" -eq 0 ]] && [[ "$list_only" -eq 0 ]] && [[ $# -eq 1 ]]; then
+          usage
+          return 0
+        fi
+        break
+        ;;
+      --)
+        shift
+        break
+        ;;
+      -*)
+        break
+        ;;
+      *)
+        break
+        ;;
+    esac
+  done
+
+  discover_backends
+  [[ ${#BACKEND_IDS[@]} -gt 0 ]] || die "no agent CLIs found (install Cursor agent or Grok)"
+
+  if [[ "$list_only" -eq 1 ]]; then
+    local i
+    for i in "${!BACKEND_IDS[@]}"; do
+      printf '%s\t%s\t%s\n' "${BACKEND_IDS[$i]}" "${BACKEND_LABELS[$i]}" "${BACKEND_BINS[$i]}"
+    done
+    return 0
+  fi
+
+  if [[ -z "$backend" ]]; then
+    if [[ ${#BACKEND_IDS[@]} -eq 1 ]]; then
+      backend="${BACKEND_IDS[0]}"
+    else
+      local default_id=""
+      default_id="$(read_default_backend 2>/dev/null || true)"
+      if [[ "$force_pick" -eq 0 ]] && [[ -n "${default_id:-}" ]] \
+        && backend_index_for_id "$default_id" >/dev/null 2>&1; then
+        backend="$default_id"
+      else
+        backend="$(pick_backend_id "agent-pick — pick CLI (↑↓ Enter, Esc cancel)")" || return 1
+      fi
+    fi
+  fi
+
+  backend_index_for_id "$backend" >/dev/null 2>&1 || die "backend not installed: $backend"
+  run_backend "$backend" "$@"
+}
+
+main "$@"

@@ -63,7 +63,8 @@ for utility_bin in \\
   "\$UTILITY_HOME/git-park/bin" \\
   "\$UTILITY_HOME/git-recent/bin" \\
   "\$UTILITY_HOME/giftool/bin" \\
-  "\$UTILITY_HOME/caffeinate-lid/bin"
+  "\$UTILITY_HOME/caffeinate-lid/bin" \\
+  "\$UTILITY_HOME/agent-pick/bin"
 do
   if [ -d "\$utility_bin" ] && [[ ":\$PATH:" != *":\$utility_bin:"* ]]; then
     export PATH="\$utility_bin:\$PATH"
@@ -75,6 +76,17 @@ alias gpark='git park'
 alias parkcd='cd "\$(git park go)"'
 alias parkhome='cd "\$(git park home)"'
 alias pgp='park go --pick'
+
+agent() {
+  agent-pick "\$@"
+}
+alias agp='agent-pick --pick'
+cursor-agent() {
+  agent-pick --cursor "\$@"
+}
+grok-agent() {
+  agent-pick --grok "\$@"
+}
 
 park() {
   case "\${1:-}" in
