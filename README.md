@@ -20,6 +20,9 @@ Personal utility tools live in dedicated subdirectories so new tools can be adde
 - `agent-pick/`
   - `bin/agent-pick`: interactive picker for Cursor vs Grok agent CLIs
   - `README.md`: usage and shell setup
+- `process-pick/`
+  - `bin/process-pick`: interactive process monitor and killer
+  - `README.md`: usage and shell setup
 
 ## PATH
 
@@ -38,7 +41,7 @@ Install or refresh the shell setup automatically:
 source ~/.bashrc
 ```
 
-The installer adds a managed block to `~/.bashrc` for `git park`, `git recent`, ClipFlip/GIF tools, `caffeinate-lid`, and `agent-pick`. It is safe to rerun; the managed block is replaced instead of duplicated.
+The installer adds a managed block to `~/.bashrc` for `git park`, `git recent`, ClipFlip/GIF tools, `caffeinate-lid`, `agent-pick`, and `process-pick`. It is safe to rerun; the managed block is replaced instead of duplicated.
 
 Add tool bins to your shell config (Bash example):
 
@@ -46,6 +49,7 @@ Add tool bins to your shell config (Bash example):
 export PATH="$HOME/utility/git-park/bin:$HOME/utility/git-recent/bin:$PATH"
 export PATH="$HOME/utility/giftool/bin:$PATH"
 export PATH="$HOME/utility/caffeinate-lid/bin:$PATH"
+export PATH="$HOME/utility/process-pick/bin:$PATH"
 ```
 
 Then reload:

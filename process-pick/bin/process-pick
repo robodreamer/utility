@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# Interactive process picker for inspecting and terminating noisy local jobs.
+set -euo pipefail
+
+SELF_PID="$$"
+SIGNAL="TERM"
+ALL_USERS=""
+DRY_RUN=""
+LIST_ONLY=""
+FULL=""
+NO_COLOR_FLAG=""
+
+usage() {
+  cat <<'EOF'
+process-pick - find and terminate stale local workloads
+
+Usage:
+  process-pick [options]
+
+Options:
+  -a, --all-users      Include processes owned by other users.
+  -f, --full           Show all non-system processes instead of cleanup candidates.
+  -s, --signal SIGNAL  Signal to send. Default: TERM.
+  -9, --kill           Shortcut for --signal KILL.
+      --dry-run        Print selected PIDs without killing.
+      --list           Print the process table used by the picker.
+      --no-color       Disable colored output.
+  -h, --help           Show this help.
+
+Examples:
+  process-pick
+  process-pick --full
+  process-pick --all-users
+  process-pick --signal INT
+  process-pick --kill
+
+Shell setup also installs:
+  pkp                  Alias for process-pick
+EOF
+}
+
+die() {
+  printf 'process-pick: %s\n' "$*" >&2
+  exit 1
+}
+
+have_tty() {
+  [[ -t 0 || -t 1 || -t 2 ]] && [[ -r /dev/tty ]]
+}
+
+have_fzf() {
+  command -v fzf >/dev/null 2>&1
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -a|--all-users)
+      ALL_USERS="1"; shift ;;
+    -f|--full)
+      FULL="1"; shift ;;
+    -s|--signal)
+      SIGNAL="${2:-}"; [[ -n "$SIGNAL" ]] || die "missing value for --signal"; shift 2 ;;
+    -9|--kill)
+      SIGNAL="KILL"; shift ;;
+    --dry-run)
+      DRY_RUN="1"; shift ;;
+    --list)
+      LIST_ONLY="1"; shift ;;
+    --no-color)
+      NO_COLOR_FLAG="1"; shift ;;
+    -h|--help)
+      usage; exit 0 ;;
+    *)
+      die "unknown option: $1" ;;
+  esac
+done
+
+process_rows() {
+  local ps_args=(-eo pid=,ppid=,user=,stat=,pcpu=,pmem=,etimes=,args= --sort=-pcpu)
+  local color=""
+  if [[ -z "$NO_COLOR_FLAG" && ( "${PROCESS_PICK_COLOR:-}" == "1" || ( -z "${NO_COLOR:-}" && -t 1 ) ) ]]; then
+    color="1"
+  fi
+
+  ps "${ps_args[@]}" | awk \
+    -v self="$SELF_PID" \
+    -v current_user="$USER" \
+    -v all_users="$ALL_USERS" \
+    -v full="$FULL" \
+    -v color="$color" '
+    BEGIN {
+      reset = color ? "\033[0m" : ""
+      dim = color ? "\033[2m" : ""
+      red = color ? "\033[31m" : ""
+      green = color ? "\033[32m" : ""
+      yellow = color ? "\033[33m" : ""
+      blue = color ? "\033[34m" : ""
+      magenta = color ? "\033[35m" : ""
+      cyan = color ? "\033[36m" : ""
+      bold = color ? "\033[1m" : ""
+    }
+    function paint(value, code) {
+      return code value reset
+    }
+    function reason_color(reason) {
+      if (reason == "hot") return red
+      if (reason == "stale") return yellow
+      if (reason == "warm") return magenta
+      if (reason == "agent") return cyan
+      if (reason == "dev" || reason == "robot" || reason == "server") return blue
+      return dim
+    }
+    function cpu_color(cpu) {
+      if (cpu >= 50) return red
+      if (cpu >= 20) return yellow
+      if (cpu >= 5) return cyan
+      return green
+    }
+    function age_color(etimes) {
+      if (etimes >= 21600) return yellow
+      if (etimes >= 7200) return magenta
+      return dim
+    }
+    function basename(path) {
+      sub(/^.*\//, "", path)
+      return path
+    }
+    function age(sec) {
+      sec += 0
+      days = int(sec / 86400); sec %= 86400
+      hours = int(sec / 3600); sec %= 3600
+      mins = int(sec / 60)
+      if (days > 0) return days "d" hours "h"
+      if (hours > 0) return hours "h" mins "m"
+      return mins "m"
+    }
+    function trim_command(s) {
+      gsub(/\/home\/[^\/ ]+/, "~", s)
+      sub(/^\/usr\/bin\//, "", s)
+      sub(/^\/usr\/lib\/[^ ]+\//, "", s)
+      sub(/^\/snap\/[^ ]+\/[0-9]+\/[^ ]+\//, "", s)
+      sub(/^\/opt\/google\/chrome\//, "", s)
+      gsub(/--[A-Za-z0-9._-]+(=[^ ]+)?/, "", s)
+      gsub(/[[:space:]]+/, " ", s)
+      sub(/^[[:space:]]+/, "", s)
+      if (length(s) > 88) return substr(s, 1, 85) "..."
+      return s
+    }
+    function short_name(args) {
+      split(args, parts, /[[:space:]]+/)
+      name = basename(parts[1])
+      if (name == "python" || name ~ /^python[0-9.]*$/) {
+        for (i = 2; i <= length(parts); i++) {
+          if (parts[i] !~ /^-/) return basename(parts[i])
+        }
+      }
+      if (name == "node") {
+        for (i = 2; i <= length(parts); i++) {
+          if (parts[i] !~ /^-/) return basename(parts[i])
+        }
+      }
+      return name
+    }
+    function candidate_reason(comm, args, cpu, etimes) {
+      if (args ~ /dev_examples\/|pixi run|ros2 launch|colcon|pytest|python .*examples?\//) return "dev"
+      if (args ~ /systemd-inhibit .*codex|sleep 214748/) return ""
+      if (args ~ /codex|cursor-agent|grok|claude|gemini/) {
+        if (etimes >= 1800 || cpu >= 25) return "agent"
+        return ""
+      }
+      if (args ~ /node .*vite|npm run|pnpm|yarn .*dev|next dev/) return "server"
+      if (args ~ /robot_state_publisher|merge_joint_states|rviz|sockpuppet/) return "robot"
+      if (cpu >= 20 && etimes >= 300) return "hot"
+      if (etimes >= 7200 && cpu >= 2) return "stale"
+      if (cpu >= 5 && etimes >= 3600) return "warm"
+      return ""
+    }
+    function is_noise(comm, args) {
+      if (args ~ /firefox|chrome|chromium|slack|todoist|wezterm|gnome-shell|Xorg|x-terminal-emulator/) return 1
+      if (args ~ /pipewire|pulseaudio|ibus|tracker-miner|xdg-|gvfs|evolution-/) return 1
+      return 0
+    }
+    {
+      pid=$1; ppid=$2; user=$3; stat=$4; cpu=$5; mem=$6; etimes=$7
+      args = ""
+      for (i = 8; i <= NF; i++) args = args (args == "" ? "" : " ") $i
+      comm = short_name(args)
+      if (pid == self || ppid == self) next
+      if (pid == 1) next
+      if (stat ~ /^I/ || args ~ /^\[/) next
+      if (!all_users && user != current_user) next
+      reason = candidate_reason(comm, args, cpu, etimes)
+      if (!full && reason == "") next
+      if (!full && is_noise(comm, args)) next
+      if (full && is_noise(comm, args) && cpu < 10) next
+      if (reason == "") reason = "look"
+      reason_out = paint(sprintf("%-6s", reason), reason_color(reason))
+      cpu_out = paint(sprintf("%5.1f%%", cpu), cpu_color(cpu))
+      age_out = paint(sprintf("%7s", age(etimes)), age_color(etimes))
+      printf "%7s  %s %s %5.1f%% %s  %-16s %s\n", pid, reason_out, cpu_out, mem, age_out, comm, trim_command(args)
+    }
+  '
+}
+
+print_header() {
+  if [[ -z "$NO_COLOR_FLAG" && ( "${PROCESS_PICK_COLOR:-}" == "1" || ( -z "${NO_COLOR:-}" && -t 1 ) ) ]]; then
+    printf '\033[1m%7s  %-6s %6s %6s %7s  %-16s %s\033[0m\n' PID WHY CPU MEM AGE COMMAND DETAILS
+  else
+    printf '%7s  %-6s %6s %6s %7s  %-16s %s\n' PID WHY CPU MEM AGE COMMAND DETAILS
+  fi
+}
+
+pick_with_fzf() {
+  PROCESS_PICK_COLOR=1 process_rows | fzf \
+    --ansi \
+    --multi \
+    --layout=reverse \
+    --height=85% \
+    --border=rounded \
+    --header='cleanup candidates | Tab select | Enter sends '"$SIGNAL"' | --full broad view | color: why/heat/age' \
+    --prompt='pkp> ' \
+    --preview='pid=$(awk "{print \$1}" <<< {}); ps -p "$pid" -o pid,ppid,pgid,sid,stat,pcpu,pmem,etimes,comm,args 2>/dev/null; echo; if command -v pstree >/dev/null 2>&1; then pstree -sap "$pid" 2>/dev/null | sed -E "s#/home/[^/]+#~#g; s#/snap/[^ ]+/[0-9]+/[^ ]+/##g"; fi' \
+    --preview-window='down,35%,wrap'
+}
+
+pick_with_menu() {
+  local tmp_file i line n
+  tmp_file="$(mktemp)"
+  trap 'rm -f "$tmp_file"' RETURN
+  process_rows > "$tmp_file"
+  [[ -s "$tmp_file" ]] || die "no matching processes"
+
+  print_header >&2
+  nl -w2 -s') ' "$tmp_file" | sed -n '1,40p' >&2
+  printf '\nEnter one or more numbers separated by spaces, or 0 to cancel: ' >&2
+  have_tty || die "interactive selection needs a terminal"
+  read -r line </dev/tty || return 1
+  [[ -n "$line" && "$line" != "0" ]] || return 1
+
+  for n in $line; do
+    [[ "$n" =~ ^[0-9]+$ ]] || die "not a number: $n"
+    i="$(sed -n "${n}p" "$tmp_file")"
+    [[ -n "$i" ]] || die "selection out of range: $n"
+    printf '%s\n' "$i"
+  done
+}
+
+selected=""
+if [[ -n "$LIST_ONLY" ]]; then
+  print_header
+  process_rows
+  exit 0
+fi
+
+if have_fzf && have_tty; then
+  selected="$(pick_with_fzf || true)"
+else
+  selected="$(pick_with_menu || true)"
+fi
+
+[[ -n "$selected" ]] || {
+  printf 'process-pick: cancelled\n' >&2
+  exit 1
+}
+
+mapfile -t pids < <(awk '{print $1}' <<< "$selected" | sort -n -u)
+[[ "${#pids[@]}" -gt 0 ]] || die "no PIDs selected"
+
+printf 'Selected processes:\n'
+print_header
+printf '%s\n' "$selected"
+printf '\n'
+
+if [[ -n "$DRY_RUN" ]]; then
+  printf 'Dry run: would send %s to: %s\n' "$SIGNAL" "${pids[*]}"
+  exit 0
+fi
+
+for pid in "${pids[@]}"; do
+  if [[ "$pid" == "$SELF_PID" || "$pid" == "1" ]]; then
+    printf 'Skipping protected pid %s\n' "$pid" >&2
+    continue
+  fi
+  if kill "-$SIGNAL" "$pid" 2>/dev/null; then
+    printf 'Sent %s to %s\n' "$SIGNAL" "$pid"
+  else
+    printf 'Failed to signal %s with %s\n' "$pid" "$SIGNAL" >&2
+  fi
+done

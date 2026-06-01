@@ -9,6 +9,10 @@ fake_bin="$tmp_dir/bin"
 log_file="$tmp_dir/commands.log"
 mkdir -p "$fake_bin"
 
+for tool in bash cat chmod dirname; do
+  ln -s "$(command -v "$tool")" "$fake_bin/$tool"
+done
+
 cat > "$fake_bin/apt-get" <<'EOF'
 #!/usr/bin/env bash
 printf 'apt-get %s\n' "$*" >> "$TEST_INSTALL_DEPS_LOG"
@@ -29,7 +33,7 @@ fi
 EOF
 chmod +x "$fake_bin/sudo"
 
-TEST_INSTALL_DEPS_LOG="$log_file" PATH="$fake_bin:/usr/bin:/bin" "$repo_root/install-deps" > "$tmp_dir/output.log"
+TEST_INSTALL_DEPS_LOG="$log_file" PATH="$fake_bin" "$repo_root/install-deps" > "$tmp_dir/output.log"
 
 expected="$tmp_dir/expected.log"
 cat > "$expected" <<'EOF'
