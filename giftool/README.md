@@ -202,7 +202,7 @@ videotool \
   -o annotated-join.mp4
 ```
 
-In the app, use **Add Timed Overlay** under Annotation. Overlay times are measured after trimming and joining, so `0` is always the beginning of the rendered output. Empty overlay rows are ignored, overlapping ranges are allowed, and the app rejects ranges that extend beyond the current output duration.
+In the app, move the preview playhead to the desired insertion point, then use **Add at Current Preview Position** under Annotation. Each overlay starts there with a three-second default duration, which can be adjusted with a number field or slider. For joined media, the app uses the combined preview playhead when available or converts the selected clip's playhead to its position on the final sequence. Empty overlay rows are ignored, overlapping ranges are allowed, and edited ranges are constrained to the current output duration.
 
 ## Repository Layout
 

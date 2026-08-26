@@ -326,10 +326,13 @@ class TrimTool:
         self.join_revision = 0
         self.join_trim_syncing = False
         self.join_selected_index = 0
+        self.join_output_scrub_time = 0.0
+        self.join_playhead_source = "clip"
         self.caption_text = ""
         self.caption_position = "bottom"
         self.caption_size = 36
         self.text_overlays: list[TextOverlay] = []
+        self.text_overlay_syncing = False
         self.output_path: Path | None = None
         self.start_time = 0.0
         self.end_time = 0.0
@@ -377,7 +380,9 @@ class TrimTool:
         self.source_video = None
         self.compare_video = None
         self.join_videos: dict[int, Any] = {}
+        self.join_output_video = None
         self.join_trim_controls: dict[int, dict[str, Any]] = {}
+        self.text_overlay_controls: dict[int, dict[str, Any]] = {}
         self.gif_frame_image = None
         self.start_slider = None
         self.end_slider = None
@@ -751,6 +756,7 @@ class TrimTool:
         self.compare_end_input = None
         self.compare_scrub_input = None
         self.join_videos = {}
+        self.join_output_video = None
         self.join_trim_controls = {}
         with ui.column().classes("panel gap-4"):
             with ui.row().classes("items-center justify-between w-full"):
@@ -784,10 +790,17 @@ class TrimTool:
                     join_video = ui.video(self.join_preview_path).props("controls preload=metadata muted").classes(
                         "media-view"
                     )
+                    self.join_output_video = join_video
                     join_video.on(
                         "error",
                         self.on_output_media_error,
                         js_handler=f"() => emit(window.giftoolRecoverMedia({join_video.id}))",
+                    )
+                    join_video.on(
+                        "timeupdate",
+                        self.on_join_output_time_update,
+                        js_handler="(event) => emit(event.target.currentTime)",
+                        throttle=0.2,
                     )
 
             if self.output_path:
@@ -919,6 +932,7 @@ class TrimTool:
         if index < 0 or index >= len(self.join_infos) or index == self.join_selected_index:
             return
         self.join_selected_index = index
+        self.join_playhead_source = "clip"
         self.preview_panel.refresh()
 
     def join_clip_preview_tab(self, index: int) -> None:
@@ -1085,6 +1099,7 @@ class TrimTool:
         start = self.join_start_times[index]
         end = self.join_end_times[index]
         scrub = max(start, min(parse_number(value), end))
+        self.join_playhead_source = "clip"
         if abs(scrub - self.join_scrub_times[index]) < 0.03:
             return
         self.join_scrub_times[index] = scrub
@@ -1100,7 +1115,16 @@ class TrimTool:
         start = self.join_start_times[index]
         end = self.join_end_times[index]
         self.join_scrub_times[index] = max(start, min(parse_number(raw_value, start), end))
+        self.join_playhead_source = "clip"
         self.sync_join_trim_controls(index)
+
+    def on_join_output_time_update(self, event: events.GenericEventArguments) -> None:
+        raw_value = event.args[0] if isinstance(event.args, list) and event.args else event.args
+        self.join_output_scrub_time = max(
+            0.0,
+            min(parse_number(raw_value, self.join_output_scrub_time), self.output_timeline_duration()),
+        )
+        self.join_playhead_source = "output"
 
     async def play_join_clip(self, index: int, loop: bool = False) -> None:
         video = self.join_videos.get(index)
@@ -1306,6 +1330,7 @@ class TrimTool:
         self.crf_slider = None
         self.preset_select = None
         self.copy_checkbox = None
+        self.text_overlay_controls = {}
         active_info = self.output_info()
 
         with ui.column().classes("panel gap-4"):
@@ -1415,9 +1440,14 @@ class TrimTool:
                 ui.label("Timed overlays").classes("section-title")
                 timeline_duration = self.output_timeline_duration()
                 ui.label(
-                    f"Times use the final output timeline ({format_seconds(timeline_duration)} currently)."
+                    f"Times use the final output timeline ({format_seconds(timeline_duration)} currently). "
+                    "New overlays start at the current preview position."
                 ).classes("muted")
                 for index, overlay in enumerate(self.text_overlays):
+                    overlay_duration = max(0.01, overlay.end - overlay.start)
+                    remaining = max(0.01, timeline_duration - overlay.start)
+                    duration_slider_max = max(0.02, overlay_duration, min(10.0, remaining))
+                    duration_slider_step = 0.25 if duration_slider_max >= 0.25 else 0.01
                     with ui.card().classes("w-full gap-2 shadow-none border"):
                         with ui.row().classes("w-full items-center gap-2"):
                             ui.label(f"Overlay {index + 1}").classes("section-title grow")
@@ -1430,20 +1460,30 @@ class TrimTool:
                             on_change=lambda e, i=index: self.update_text_overlay(i, "text", e.value),
                         ).props("outlined dense clearable").classes("w-full")
                         with ui.row().classes("w-full gap-2"):
-                            ui.number(
+                            start_input = ui.number(
                                 "Start",
                                 value=overlay.start,
                                 min=0,
+                                max=timeline_duration,
                                 step=0.1,
                                 on_change=lambda e, i=index: self.update_text_overlay(i, "start", e.value),
                             ).props("outlined dense suffix=s").classes("grow")
-                            ui.number(
-                                "End",
-                                value=overlay.end,
-                                min=0,
+                            duration_input = ui.number(
+                                "Duration",
+                                value=round(overlay_duration, 3),
+                                min=0.01,
+                                max=remaining,
                                 step=0.1,
-                                on_change=lambda e, i=index: self.update_text_overlay(i, "end", e.value),
+                                on_change=lambda e, i=index: self.update_text_overlay(i, "duration", e.value),
                             ).props("outlined dense suffix=s").classes("grow")
+                        duration_slider = ui.slider(
+                            min=0.01,
+                            max=duration_slider_max,
+                            value=min(overlay_duration, duration_slider_max),
+                            step=duration_slider_step,
+                            on_change=lambda e, i=index: self.update_text_overlay(i, "duration", e.value),
+                        ).props("label-always").classes("w-full")
+                        range_label = ui.label(self.text_overlay_range_text(overlay)).classes("muted")
                         with ui.row().classes("w-full gap-2"):
                             ui.select(
                                 ["bottom", "top", "center"],
@@ -1459,13 +1499,20 @@ class TrimTool:
                                 step=2,
                                 on_change=lambda e, i=index: self.update_text_overlay(i, "size", e.value),
                             ).props("outlined dense").classes("grow")
-                ui.button("Add Timed Overlay", icon="add", on_click=self.add_text_overlay).props(
+                        self.text_overlay_controls[index] = {
+                            "start_input": start_input,
+                            "duration_input": duration_input,
+                            "duration_slider": duration_slider,
+                            "range_label": range_label,
+                        }
+                ui.button("Add at Current Preview Position", icon="add", on_click=self.add_text_overlay).props(
                     "outline"
                 ).classes("w-full")
 
                 ui.separator()
+                ui.label("Encoding Quality").classes("section-title")
+                ui.label("CRF: lower values preserve more detail and produce larger files.").classes("muted")
                 self.crf_slider = ui.slider(min=16, max=30, value=20, step=1).props("label-always")
-                ui.label("CRF quality").classes("muted")
                 self.preset_select = ui.select(
                     ["veryfast", "faster", "fast", "medium", "slow", "slower"],
                     value="medium",
@@ -1658,6 +1705,30 @@ class TrimTool:
             duration = min(duration, compare_duration)
         return duration
 
+    def current_output_playhead(self) -> float:
+        duration = self.output_timeline_duration()
+        if duration <= 0:
+            return 0.0
+        if self.join_active() and self.join_infos:
+            if self.join_playhead_source == "output":
+                return min(duration, max(0.0, self.join_output_scrub_time))
+            index = min(self.join_selected_index, len(self.join_infos) - 1)
+            elapsed = sum(
+                max(0.0, end - start)
+                for start, end in zip(self.join_start_times[:index], self.join_end_times[:index])
+            )
+            clip_start = self.join_start_times[index]
+            clip_end = self.join_end_times[index]
+            clip_time = max(clip_start, min(self.join_scrub_times[index], clip_end))
+            return min(duration, elapsed + max(0.0, clip_time - clip_start))
+        return min(duration, max(0.0, self.scrub_time - self.start_time))
+
+    def text_overlay_range_text(self, overlay: TextOverlay) -> str:
+        return (
+            f"Final output: {format_seconds(overlay.start)} to {format_seconds(overlay.end)} "
+            f"({format_seconds(max(0.0, overlay.end - overlay.start))})"
+        )
+
     def set_caption_text(self, value: Any) -> None:
         self.caption_text = str(value or "")
         self.invalidate_rendered_join_output()
@@ -1672,13 +1743,23 @@ class TrimTool:
         self.invalidate_rendered_join_output()
 
     def add_text_overlay(self) -> None:
-        duration = self.output_timeline_duration()
-        if duration <= 0:
+        timeline_duration = self.output_timeline_duration()
+        if timeline_duration <= 0:
             ui.notify("Load media with a positive duration before adding a timed overlay.", type="warning")
             return
-        self.text_overlays.append(TextOverlay(text="", start=0.0, end=duration))
+        start = min(timeline_duration, max(0.0, self.current_output_playhead()))
+        remaining = timeline_duration - start
+        if remaining <= 0.01:
+            start = max(0.0, timeline_duration - min(3.0, timeline_duration))
+            remaining = timeline_duration - start
+        overlay_duration = min(3.0, remaining)
+        self.text_overlays.append(TextOverlay(text="", start=start, end=start + overlay_duration))
         self.invalidate_rendered_join_output()
         self.controls_panel.refresh()
+        ui.notify(
+            f"Timed overlay added at {format_seconds(start)} for {format_seconds(overlay_duration)}.",
+            type="positive",
+        )
 
     def remove_text_overlay(self, index: int) -> None:
         if index < 0 or index >= len(self.text_overlays):
@@ -1688,21 +1769,52 @@ class TrimTool:
         self.controls_panel.refresh()
 
     def update_text_overlay(self, index: int, field: str, value: Any) -> None:
-        if index < 0 or index >= len(self.text_overlays):
+        if self.text_overlay_syncing or index < 0 or index >= len(self.text_overlays):
             return
         overlay = self.text_overlays[index]
         if field == "text":
             overlay.text = str(value or "")
         elif field == "start":
-            overlay.start = max(0.0, parse_number(value, overlay.start))
-        elif field == "end":
-            overlay.end = max(0.0, parse_number(value, overlay.end))
+            timeline_duration = self.output_timeline_duration()
+            current_duration = max(0.01, overlay.end - overlay.start)
+            start = max(0.0, min(parse_number(value, overlay.start), timeline_duration))
+            if timeline_duration - start <= 0.01:
+                start = max(0.0, timeline_duration - min(current_duration, timeline_duration))
+            overlay.start = start
+            overlay.end = min(timeline_duration, start + current_duration)
+        elif field == "duration":
+            remaining = max(0.01, self.output_timeline_duration() - overlay.start)
+            duration = max(0.01, min(parse_number(value, overlay.end - overlay.start), remaining))
+            overlay.end = overlay.start + duration
         elif field == "position":
             position = str(value or "bottom")
             overlay.position = position if position in {"top", "center", "bottom"} else "bottom"
         elif field == "size":
             overlay.size = max(12, min(96, int(parse_number(value, overlay.size))))
         self.invalidate_rendered_join_output()
+        self.sync_text_overlay_controls(index)
+
+    def sync_text_overlay_controls(self, index: int) -> None:
+        controls = self.text_overlay_controls.get(index)
+        if controls is None or index >= len(self.text_overlays):
+            return
+        overlay = self.text_overlays[index]
+        duration = max(0.01, overlay.end - overlay.start)
+        remaining = max(0.01, self.output_timeline_duration() - overlay.start)
+        slider_max = max(0.02, duration, min(10.0, remaining))
+        slider_step = 0.25 if slider_max >= 0.25 else 0.01
+        self.text_overlay_syncing = True
+        try:
+            controls["start_input"].set_value(round(overlay.start, 3))
+            controls["duration_input"].props["max"] = remaining
+            controls["duration_input"].set_value(round(duration, 3))
+            controls["duration_slider"].props["min"] = 0.01
+            controls["duration_slider"].props["max"] = slider_max
+            controls["duration_slider"].props["step"] = slider_step
+            controls["duration_slider"].set_value(min(duration, slider_max))
+            controls["range_label"].set_text(self.text_overlay_range_text(overlay))
+        finally:
+            self.text_overlay_syncing = False
 
     def append_timed_overlay_args(self, cmd: list[str], output_duration: float) -> bool:
         active = False
@@ -2067,6 +2179,8 @@ class TrimTool:
             self.join_end_times = end_times
             self.join_scrub_times = scrub_times
             self.join_video_preview_paths = video_preview_paths
+            self.join_output_scrub_time = 0.0
+            self.join_playhead_source = "clip"
             self.join_revision += 1
             self.join_enabled = bool(paths)
             self.compare_enabled = False
@@ -2755,6 +2869,8 @@ class TrimTool:
         self.join_scrub_times = []
         self.join_video_preview_paths = []
         self.join_selected_index = 0
+        self.join_output_scrub_time = 0.0
+        self.join_playhead_source = "clip"
         self.join_enabled = False
         self.invalidate_rendered_join_output()
         if self.join_paths_input:
@@ -2777,6 +2893,8 @@ class TrimTool:
         self.join_scrub_times = []
         self.join_video_preview_paths = []
         self.join_selected_index = 0
+        self.join_output_scrub_time = 0.0
+        self.join_playhead_source = "clip"
         self.compare_enabled = False
         self.join_enabled = False
         self.caption_text = ""
@@ -3016,6 +3134,8 @@ class TrimTool:
             old_preview = self.join_preview_path
             temporary_output.replace(preview_output)
             self.join_preview_path = preview_output
+            self.join_output_scrub_time = 0.0
+            self.join_playhead_source = "output"
             if old_preview is not None:
                 old_preview.unlink(missing_ok=True)
             self.preview_panel.refresh()
