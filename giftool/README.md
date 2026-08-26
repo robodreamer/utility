@@ -29,6 +29,7 @@ The current app supports:
 - editable output paths plus server-side save-copy support for placing rendered files outside the app cache.
 - width, height, scale, and FPS controls.
 - subtitle-style MP4 text overlays.
+- multiple timed text overlays placed anywhere on the final output timeline.
 - side-by-side comparison renders with independent trim ranges and panel labels.
 - multi-clip joining that works as a complete source without first loading a separate single clip.
 - independent start/end trims for every joined clip, with one active clip preview to keep memory use bounded.
@@ -188,6 +189,20 @@ videotool \
 In the app, add all files under **Combine Clips**, choose a clip in the Preview panel to set its start and end handles, then use the arrow controls to change the sequence. **Preview Join** renders the same order, trims, sizing, and caption settings used by the final output.
 
 Join mode normalizes clip dimensions and frame rates for clean cuts between inputs. It preserves audio when every input has an audio stream; if any input is silent, the joined output is rendered without audio.
+
+Add repeatable text overlays to specific parts of the final output timeline:
+
+```bash
+videotool \
+  -i intro.mp4 \
+  --concat result.mp4 \
+  --timed-text "Introduction" --timed-text-start 0 --timed-text-end 2.5 \
+  --timed-text "Result" --timed-text-start 6 --timed-text-end 10 \
+  --timed-text-position top --timed-text-size 42 \
+  -o annotated-join.mp4
+```
+
+In the app, use **Add Timed Overlay** under Annotation. Overlay times are measured after trimming and joining, so `0` is always the beginning of the rendered output. Empty overlay rows are ignored, overlapping ranges are allowed, and the app rejects ranges that extend beyond the current output duration.
 
 ## Repository Layout
 

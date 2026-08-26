@@ -98,6 +98,15 @@ class MediaInfo:
 
 
 @dataclass
+class TextOverlay:
+    text: str
+    start: float
+    end: float
+    position: str = "bottom"
+    size: int = 36
+
+
+@dataclass
 class GifPreviewFile:
     start: float
     end: float
@@ -317,6 +326,10 @@ class TrimTool:
         self.join_revision = 0
         self.join_trim_syncing = False
         self.join_selected_index = 0
+        self.caption_text = ""
+        self.caption_position = "bottom"
+        self.caption_size = 36
+        self.text_overlays: list[TextOverlay] = []
         self.output_path: Path | None = None
         self.start_time = 0.0
         self.end_time = 0.0
@@ -1377,16 +1390,78 @@ class TrimTool:
             if mp4_output:
                 ui.separator()
                 ui.label("Annotation").classes("section-title")
-                self.caption_input = ui.input("Caption/subtitle").props("outlined dense clearable").classes("w-full")
+                ui.label("Full-video caption").classes("muted")
+                self.caption_input = ui.input(
+                    "Caption/subtitle",
+                    value=self.caption_text,
+                    on_change=lambda e: self.set_caption_text(e.value),
+                ).props("outlined dense clearable").classes("w-full")
                 with ui.row().classes("w-full gap-2"):
                     self.text_position_select = ui.select(
                         ["bottom", "top", "center"],
-                        value="bottom",
+                        value=self.caption_position,
                         label="Caption position",
+                        on_change=lambda e: self.set_caption_position(e.value),
                     ).props("outlined dense").classes("grow")
-                    self.text_size_input = ui.number("Text size", value=36, min=12, max=96, step=2).props(
-                        "outlined dense"
-                    ).classes("grow")
+                    self.text_size_input = ui.number(
+                        "Text size",
+                        value=self.caption_size,
+                        min=12,
+                        max=96,
+                        step=2,
+                        on_change=lambda e: self.set_caption_size(e.value),
+                    ).props("outlined dense").classes("grow")
+
+                ui.label("Timed overlays").classes("section-title")
+                timeline_duration = self.output_timeline_duration()
+                ui.label(
+                    f"Times use the final output timeline ({format_seconds(timeline_duration)} currently)."
+                ).classes("muted")
+                for index, overlay in enumerate(self.text_overlays):
+                    with ui.card().classes("w-full gap-2 shadow-none border"):
+                        with ui.row().classes("w-full items-center gap-2"):
+                            ui.label(f"Overlay {index + 1}").classes("section-title grow")
+                            ui.button(
+                                icon="close", on_click=lambda i=index: self.remove_text_overlay(i)
+                            ).props("flat dense")
+                        ui.input(
+                            "Text",
+                            value=overlay.text,
+                            on_change=lambda e, i=index: self.update_text_overlay(i, "text", e.value),
+                        ).props("outlined dense clearable").classes("w-full")
+                        with ui.row().classes("w-full gap-2"):
+                            ui.number(
+                                "Start",
+                                value=overlay.start,
+                                min=0,
+                                step=0.1,
+                                on_change=lambda e, i=index: self.update_text_overlay(i, "start", e.value),
+                            ).props("outlined dense suffix=s").classes("grow")
+                            ui.number(
+                                "End",
+                                value=overlay.end,
+                                min=0,
+                                step=0.1,
+                                on_change=lambda e, i=index: self.update_text_overlay(i, "end", e.value),
+                            ).props("outlined dense suffix=s").classes("grow")
+                        with ui.row().classes("w-full gap-2"):
+                            ui.select(
+                                ["bottom", "top", "center"],
+                                value=overlay.position,
+                                label="Position",
+                                on_change=lambda e, i=index: self.update_text_overlay(i, "position", e.value),
+                            ).props("outlined dense").classes("grow")
+                            ui.number(
+                                "Text size",
+                                value=overlay.size,
+                                min=12,
+                                max=96,
+                                step=2,
+                                on_change=lambda e, i=index: self.update_text_overlay(i, "size", e.value),
+                            ).props("outlined dense").classes("grow")
+                ui.button("Add Timed Overlay", icon="add", on_click=self.add_text_overlay).props(
+                    "outline"
+                ).classes("w-full")
 
                 ui.separator()
                 self.crf_slider = ui.slider(min=16, max=30, value=20, step=1).props("label-always")
@@ -1568,6 +1643,94 @@ class TrimTool:
         if self.join_active() and self.join_infos:
             return self.join_infos[0]
         return self.info
+
+    def output_timeline_duration(self) -> float:
+        if self.join_active():
+            return sum(
+                max(0.0, end - start)
+                for start, end in zip(self.join_start_times, self.join_end_times)
+            )
+        if self.info is None:
+            return 0.0
+        duration = max(0.0, self.end_time - self.start_time)
+        if self.side_by_side_active():
+            compare_duration = max(0.0, self.compare_end_time - self.compare_start_time)
+            duration = min(duration, compare_duration)
+        return duration
+
+    def set_caption_text(self, value: Any) -> None:
+        self.caption_text = str(value or "")
+        self.invalidate_rendered_join_output()
+
+    def set_caption_position(self, value: Any) -> None:
+        position = str(value or "bottom")
+        self.caption_position = position if position in {"top", "center", "bottom"} else "bottom"
+        self.invalidate_rendered_join_output()
+
+    def set_caption_size(self, value: Any) -> None:
+        self.caption_size = max(12, min(96, int(parse_number(value, 36))))
+        self.invalidate_rendered_join_output()
+
+    def add_text_overlay(self) -> None:
+        duration = self.output_timeline_duration()
+        if duration <= 0:
+            ui.notify("Load media with a positive duration before adding a timed overlay.", type="warning")
+            return
+        self.text_overlays.append(TextOverlay(text="", start=0.0, end=duration))
+        self.invalidate_rendered_join_output()
+        self.controls_panel.refresh()
+
+    def remove_text_overlay(self, index: int) -> None:
+        if index < 0 or index >= len(self.text_overlays):
+            return
+        self.text_overlays.pop(index)
+        self.invalidate_rendered_join_output()
+        self.controls_panel.refresh()
+
+    def update_text_overlay(self, index: int, field: str, value: Any) -> None:
+        if index < 0 or index >= len(self.text_overlays):
+            return
+        overlay = self.text_overlays[index]
+        if field == "text":
+            overlay.text = str(value or "")
+        elif field == "start":
+            overlay.start = max(0.0, parse_number(value, overlay.start))
+        elif field == "end":
+            overlay.end = max(0.0, parse_number(value, overlay.end))
+        elif field == "position":
+            position = str(value or "bottom")
+            overlay.position = position if position in {"top", "center", "bottom"} else "bottom"
+        elif field == "size":
+            overlay.size = max(12, min(96, int(parse_number(value, overlay.size))))
+        self.invalidate_rendered_join_output()
+
+    def append_timed_overlay_args(self, cmd: list[str], output_duration: float) -> bool:
+        active = False
+        for index, overlay in enumerate(self.text_overlays, start=1):
+            text = overlay.text.strip()
+            if not text:
+                continue
+            if overlay.start < 0 or overlay.end <= overlay.start:
+                raise ValueError(f"Overlay {index} end time must be greater than its start time.")
+            if overlay.end > output_duration + 0.01:
+                raise ValueError(
+                    f"Overlay {index} ends at {format_seconds(overlay.end)}, past the "
+                    f"{format_seconds(output_duration)} output duration."
+                )
+            cmd += [
+                "--timed-text",
+                text,
+                "--timed-text-start",
+                f"{overlay.start:.3f}",
+                "--timed-text-end",
+                f"{overlay.end:.3f}",
+                "--timed-text-position",
+                overlay.position,
+                "--timed-text-size",
+                str(overlay.size),
+            ]
+            active = True
+        return active
 
     def output_base_size(self) -> tuple[int, int] | None:
         info = self.output_info()
@@ -2616,6 +2779,10 @@ class TrimTool:
         self.join_selected_index = 0
         self.compare_enabled = False
         self.join_enabled = False
+        self.caption_text = ""
+        self.caption_position = "bottom"
+        self.caption_size = 36
+        self.text_overlays = []
         self.invalidate_rendered_join_output()
         self.output_format = "auto"
         self.start_time = 0.0
@@ -2715,7 +2882,8 @@ class TrimTool:
             if loop:
                 cmd += ["--loop", loop]
         else:
-            caption = (self.caption_input.value or "").strip() if self.caption_input else ""
+            caption = (self.caption_input.value or "").strip() if self.caption_input else self.caption_text.strip()
+            self.caption_text = caption
             if comparison_active and self.compare_info is not None:
                 cmd += ["--compare", str(self.compare_info.path)]
                 if self.compare_start_time > 0:
@@ -2728,13 +2896,28 @@ class TrimTool:
                 if label_right:
                     cmd += ["--label-right", label_right]
             if caption:
-                position = self.text_position_select.value if self.text_position_select else "bottom"
-                size = int(self.text_size_input.value) if self.text_size_input and self.text_size_input.value else 36
+                position = self.text_position_select.value if self.text_position_select else self.caption_position
+                size = (
+                    int(self.text_size_input.value)
+                    if self.text_size_input and self.text_size_input.value
+                    else self.caption_size
+                )
+                self.caption_position = str(position)
+                self.caption_size = size
                 cmd += ["--text", caption, "--text-position", str(position), "--text-size", str(size)]
+
+            timed_overlay_active = self.append_timed_overlay_args(cmd, output_duration)
 
             copy_mode = bool(self.copy_checkbox.value) if self.copy_checkbox and self.info.kind == "video" else False
             has_filters = any(flag in cmd for flag in ("-w", "-h", "-f"))
-            if copy_mode and not has_filters and not comparison_active and not joining_active and not caption:
+            if (
+                copy_mode
+                and not has_filters
+                and not comparison_active
+                and not joining_active
+                and not caption
+                and not timed_overlay_active
+            ):
                 cmd.append("--copy")
             else:
                 crf = int(self.crf_slider.value) if self.crf_slider else 20
@@ -2777,11 +2960,22 @@ class TrimTool:
         if fps and fps != source_fps:
             cmd += ["-f", fps]
 
-        caption = (self.caption_input.value or "").strip() if self.caption_input else ""
+        caption = (self.caption_input.value or "").strip() if self.caption_input else self.caption_text.strip()
+        self.caption_text = caption
         if caption:
-            position = self.text_position_select.value if self.text_position_select else "bottom"
-            size = int(self.text_size_input.value) if self.text_size_input and self.text_size_input.value else 36
+            position = self.text_position_select.value if self.text_position_select else self.caption_position
+            size = (
+                int(self.text_size_input.value)
+                if self.text_size_input and self.text_size_input.value
+                else self.caption_size
+            )
+            self.caption_position = str(position)
+            self.caption_size = size
             cmd += ["--text", caption, "--text-position", str(position), "--text-size", str(size)]
+        output_duration = sum(
+            end - start for start, end in zip(self.join_start_times, self.join_end_times)
+        )
+        self.append_timed_overlay_args(cmd, output_duration)
         crf = int(self.crf_slider.value) if self.crf_slider else 20
         preset = self.preset_select.value if self.preset_select else "medium"
         cmd += ["--crf", str(crf), "--preset", str(preset)]

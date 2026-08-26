@@ -18,6 +18,15 @@ Options:
       --text TEXT         Burn one subtitle-style text overlay into the video
       --text-position POS top, center, or bottom; default bottom
       --text-size PIXELS  Text size for --text; default 36
+      --timed-text TEXT   Burn text during part of the output; repeatable
+      --timed-text-start SEC
+                          Start time for the most recent --timed-text
+      --timed-text-end SEC
+                          End time for the most recent --timed-text
+      --timed-text-position POS
+                          Position for the most recent --timed-text
+      --timed-text-size PX
+                          Size for the most recent --timed-text
       --compare FILE      Build a side-by-side comparison with another GIF or video
       --concat FILE       Append another GIF or video to the output; repeatable
       --concat-start SEC  Start time for the most recent --concat input
@@ -44,6 +53,7 @@ Examples:
   videotool -i before.mp4 --compare after.mp4 -o side-by-side.mp4 -s 2 -d 10 --compare-start 1 --compare-duration 10 --label-left Before --label-right After
   videotool -i first.mp4 --concat second.mp4 --concat third.mp4 -o joined.mp4
   videotool -i run.mp4 -o annotated.mp4 --text "model=v2, seed=42"
+  videotool -i run.mp4 -o annotated.mp4 --timed-text "Phase 2" --timed-text-start 3 --timed-text-end 8
 EOF
 }
 
@@ -58,6 +68,12 @@ fps=""
 text=""
 text_position="bottom"
 text_size="36"
+timed_texts=()
+timed_text_starts=()
+timed_text_ends=()
+timed_text_positions=()
+timed_text_sizes=()
+last_timed_text_index=""
 compare_input=""
 concat_inputs=()
 concat_starts=()
@@ -98,6 +114,38 @@ while [[ $# -gt 0 ]]; do
       text_position="${2:-}"; shift 2 ;;
     --text-size)
       text_size="${2:-}"; shift 2 ;;
+    --timed-text)
+      timed_texts+=("${2:-}")
+      timed_text_starts+=("")
+      timed_text_ends+=("")
+      timed_text_positions+=("bottom")
+      timed_text_sizes+=("36")
+      last_timed_text_index=$((${#timed_texts[@]} - 1))
+      shift 2 ;;
+    --timed-text-start)
+      if [[ -z "$last_timed_text_index" ]]; then
+        echo "--timed-text-start must follow a --timed-text." >&2
+        exit 1
+      fi
+      timed_text_starts[$last_timed_text_index]="${2:-}"; shift 2 ;;
+    --timed-text-end)
+      if [[ -z "$last_timed_text_index" ]]; then
+        echo "--timed-text-end must follow a --timed-text." >&2
+        exit 1
+      fi
+      timed_text_ends[$last_timed_text_index]="${2:-}"; shift 2 ;;
+    --timed-text-position)
+      if [[ -z "$last_timed_text_index" ]]; then
+        echo "--timed-text-position must follow a --timed-text." >&2
+        exit 1
+      fi
+      timed_text_positions[$last_timed_text_index]="${2:-}"; shift 2 ;;
+    --timed-text-size)
+      if [[ -z "$last_timed_text_index" ]]; then
+        echo "--timed-text-size must follow a --timed-text." >&2
+        exit 1
+      fi
+      timed_text_sizes[$last_timed_text_index]="${2:-}"; shift 2 ;;
     --compare)
       compare_input="${2:-}"; shift 2 ;;
     --concat)
@@ -191,7 +239,7 @@ case "$text_position" in
     exit 1 ;;
 esac
 
-if [[ -n "$copy_mode" && ( -n "$width" || -n "$height" || -n "$fps" || -n "$text" || -n "$compare_input" || ${#concat_inputs[@]} -gt 0 ) ]]; then
+if [[ -n "$copy_mode" && ( -n "$width" || -n "$height" || -n "$fps" || -n "$text" || ${#timed_texts[@]} -gt 0 || -n "$compare_input" || ${#concat_inputs[@]} -gt 0 ) ]]; then
   echo "--copy cannot be used with filters, text overlays, comparison output, or concatenation." >&2
   exit 1
 fi
@@ -221,6 +269,50 @@ positive_difference() {
     }
   '
 }
+
+validate_timed_overlay() {
+  local start_value="$1"
+  local end_value="$2"
+  local label="$3"
+  awk -v start="$start_value" -v end="$end_value" -v label="$label" '
+    function is_number(value) {
+      return value ~ /^([0-9]+([.][0-9]*)?|[.][0-9]+)$/
+    }
+    BEGIN {
+      if (!is_number(start) || !is_number(end)) {
+        printf "%s start and end times must be non-negative numbers.\n", label > "/dev/stderr"
+        exit 1
+      }
+      if (end <= start) {
+        printf "%s end time must be greater than start time.\n", label > "/dev/stderr"
+        exit 1
+      }
+    }
+  '
+}
+
+for index in "${!timed_texts[@]}"; do
+  label="Timed text $((index + 1))"
+  if [[ -z "${timed_texts[$index]}" ]]; then
+    echo "$label cannot be empty." >&2
+    exit 1
+  fi
+  if [[ -z "${timed_text_starts[$index]}" || -z "${timed_text_ends[$index]}" ]]; then
+    echo "$label requires --timed-text-start and --timed-text-end." >&2
+    exit 1
+  fi
+  validate_timed_overlay "${timed_text_starts[$index]}" "${timed_text_ends[$index]}" "$label"
+  case "${timed_text_positions[$index]}" in
+    top|center|bottom) ;;
+    *)
+      echo "$label position must be top, center, or bottom." >&2
+      exit 1 ;;
+  esac
+  if ! [[ "${timed_text_sizes[$index]}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "$label size must be a positive integer." >&2
+    exit 1
+  fi
+done
 
 minimum_duration() {
   awk -v left="$1" -v right="$2" 'BEGIN { printf "%.6f", (left < right ? left : right) }'
@@ -320,7 +412,10 @@ caption_filter() {
   local value="$1"
   local position="$2"
   local size="$3"
+  local start_value="${4:-}"
+  local end_value="${5:-}"
   local y_expr
+  local filter
 
   case "$position" in
     top)
@@ -331,8 +426,11 @@ caption_filter() {
       y_expr="h-text_h-32" ;;
   esac
 
-  printf "drawtext=text='%s':x=(w-text_w)/2:y=%s:fontcolor=white:fontsize=%s:box=1:boxcolor=black@0.55:boxborderw=14" \
-    "$(escape_drawtext "$value")" "$y_expr" "$size"
+  filter="drawtext=text='$(escape_drawtext "$value")':x=(w-text_w)/2:y=${y_expr}:fontcolor=white:fontsize=${size}:box=1:boxcolor=black@0.55:boxborderw=14"
+  if [[ -n "$start_value" && -n "$end_value" ]]; then
+    filter+=":enable='between(t,${start_value},${end_value})'"
+  fi
+  printf '%s' "$filter"
 }
 
 label_filter() {
@@ -346,6 +444,19 @@ make_even() {
   local value="$1"
   echo $(( value / 2 * 2 ))
 }
+
+caption_filters=()
+if [[ -n "$text" ]]; then
+  caption_filters+=("$(caption_filter "$text" "$text_position" "$text_size")")
+fi
+for index in "${!timed_texts[@]}"; do
+  caption_filters+=("$(caption_filter \
+    "${timed_texts[$index]}" \
+    "${timed_text_positions[$index]}" \
+    "${timed_text_sizes[$index]}" \
+    "${timed_text_starts[$index]}" \
+    "${timed_text_ends[$index]}")")
+done
 
 vf_parts=()
 
@@ -365,9 +476,7 @@ if [[ -n "$width" || -n "$height" ]]; then
   vf_parts+=("scale=${scale_w}:${scale_h}:flags=lanczos")
 fi
 
-if [[ -n "$text" ]]; then
-  vf_parts+=("$(caption_filter "$text" "$text_position" "$text_size")")
-fi
+vf_parts+=("${caption_filters[@]}")
 
 vf_parts+=("pad=ceil(iw/2)*2:ceil(ih/2)*2,setsar=1")
 
@@ -451,9 +560,9 @@ elif [[ -n "$compare_input" ]]; then
   if [[ -n "$fps" ]]; then
     post_chain+=",fps=${fps}"
   fi
-  if [[ -n "$text" ]]; then
-    post_chain+=",$(caption_filter "$text" "$text_position" "$text_size")"
-  fi
+  for caption in "${caption_filters[@]}"; do
+    post_chain+=",${caption}"
+  done
 
   filter_complex="[0:v]${left_chain}[left];[1:v]${right_chain}[right];[left][right]hstack=inputs=2:shortest=1${post_chain}[vout]"
   ffmpeg_args+=(
@@ -521,8 +630,9 @@ elif [[ -n "$concat_active" ]]; then
     concat_filter="${concat_inputs_filter}concat=n=${#all_inputs[@]}:v=1:a=0[vout_pre]"
   fi
   filter_complex="$(IFS=';'; echo "${video_chains[*]}"; if [[ -n "$every_input_has_audio" ]]; then printf ';%s' "$(IFS=';'; echo "${audio_chains[*]}")"; fi; printf ';%s' "$concat_filter")"
-  if [[ -n "$text" ]]; then
-    filter_complex+=";[vout_pre]$(caption_filter "$text" "$text_position" "$text_size")[vout]"
+  if [[ ${#caption_filters[@]} -gt 0 ]]; then
+    caption_chain="$(IFS=,; echo "${caption_filters[*]}")"
+    filter_complex+=";[vout_pre]${caption_chain}[vout]"
     video_output_label="vout"
   else
     video_output_label="vout_pre"
