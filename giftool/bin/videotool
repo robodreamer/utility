@@ -19,6 +19,10 @@ Options:
       --text-position POS top, center, or bottom; default bottom
       --text-size PIXELS  Text size for --text; default 36
       --compare FILE      Build a side-by-side comparison with another GIF or video
+      --concat FILE       Append another GIF or video to the output; repeatable
+      --concat-start SEC  Start time for the most recent --concat input
+      --concat-duration SEC
+                          Duration for the most recent --concat input
       --compare-start SEC Start time for the comparison video
       --compare-end SEC   End time for the comparison video
       --compare-duration SEC
@@ -38,6 +42,7 @@ Examples:
   videotool -i in.mp4 -o out.mp4 -e 12.0 -w 1280 --crf 22
   videotool -i in.mp4 -o clip.mp4 -s 30 -d 10 --copy
   videotool -i before.mp4 --compare after.mp4 -o side-by-side.mp4 -s 2 -d 10 --compare-start 1 --compare-duration 10 --label-left Before --label-right After
+  videotool -i first.mp4 --concat second.mp4 --concat third.mp4 -o joined.mp4
   videotool -i run.mp4 -o annotated.mp4 --text "model=v2, seed=42"
 EOF
 }
@@ -54,6 +59,10 @@ text=""
 text_position="bottom"
 text_size="36"
 compare_input=""
+concat_inputs=()
+concat_starts=()
+concat_durations=()
+last_concat_index=""
 compare_start=""
 compare_end=""
 compare_duration=""
@@ -91,6 +100,24 @@ while [[ $# -gt 0 ]]; do
       text_size="${2:-}"; shift 2 ;;
     --compare)
       compare_input="${2:-}"; shift 2 ;;
+    --concat)
+      concat_inputs+=("${2:-}")
+      concat_starts+=("")
+      concat_durations+=("")
+      last_concat_index=$((${#concat_inputs[@]} - 1))
+      shift 2 ;;
+    --concat-start)
+      if [[ -z "$last_concat_index" ]]; then
+        echo "--concat-start must follow a --concat input." >&2
+        exit 1
+      fi
+      concat_starts[$last_concat_index]="${2:-}"; shift 2 ;;
+    --concat-duration)
+      if [[ -z "$last_concat_index" ]]; then
+        echo "--concat-duration must follow a --concat input." >&2
+        exit 1
+      fi
+      concat_durations[$last_concat_index]="${2:-}"; shift 2 ;;
     --compare-start)
       compare_start="${2:-}"; shift 2 ;;
     --compare-end)
@@ -135,6 +162,13 @@ if [[ -n "$compare_input" && ! -f "$compare_input" ]]; then
   exit 1
 fi
 
+for concat_input in "${concat_inputs[@]}"; do
+  if [[ ! -f "$concat_input" ]]; then
+    echo "Concat input file not found: $concat_input" >&2
+    exit 1
+  fi
+done
+
 if [[ -n "$end" && -n "$duration" ]]; then
   echo "Use either --end or --duration, not both." >&2
   exit 1
@@ -157,8 +191,8 @@ case "$text_position" in
     exit 1 ;;
 esac
 
-if [[ -n "$copy_mode" && ( -n "$width" || -n "$height" || -n "$fps" || -n "$text" || -n "$compare_input" ) ]]; then
-  echo "--copy cannot be used with filters, text overlays, or comparison output." >&2
+if [[ -n "$copy_mode" && ( -n "$width" || -n "$height" || -n "$fps" || -n "$text" || -n "$compare_input" || ${#concat_inputs[@]} -gt 0 ) ]]; then
+  echo "--copy cannot be used with filters, text overlays, comparison output, or concatenation." >&2
   exit 1
 fi
 
@@ -167,8 +201,8 @@ if ! command -v ffmpeg >/dev/null 2>&1; then
   exit 1
 fi
 
-if [[ -n "$compare_input" ]] && ! command -v ffprobe >/dev/null 2>&1; then
-  echo "ffprobe is required for comparison duration matching but not found in PATH." >&2
+if [[ ( -n "$compare_input" || ${#concat_inputs[@]} -gt 0 ) ]] && ! command -v ffprobe >/dev/null 2>&1; then
+  echo "ffprobe is required for comparison or concatenation but not found in PATH." >&2
   exit 1
 fi
 
@@ -207,6 +241,27 @@ probe_duration() {
   '
 }
 
+probe_dimension() {
+  local file="$1"
+  local dimension="$2"
+  local value
+  value="$(ffprobe -v error -select_streams v:0 -show_entries "stream=${dimension}" -of default=nw=1:nk=1 "$file")"
+  awk -v value="$value" -v dimension="$dimension" -v file="$file" '
+    BEGIN {
+      if (value <= 0) {
+        printf "Could not determine video %s for %s.\n", dimension, file > "/dev/stderr"
+        exit 1
+      }
+      printf "%d", value
+    }
+  '
+}
+
+has_audio() {
+  local file="$1"
+  [[ -n "$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_type -of default=nw=1:nk=1 "$file")" ]]
+}
+
 if [[ -n "$compare_input" ]]; then
   input_start="${start:-0}"
   if [[ -n "$duration" ]]; then
@@ -231,6 +286,23 @@ if [[ -n "$compare_input" ]]; then
   compare_duration="$output_trim_duration"
   end=""
   compare_end=""
+fi
+
+concat_active=""
+if [[ ${#concat_inputs[@]} -gt 0 ]]; then
+  if [[ -n "$compare_input" ]]; then
+    echo "Use either --compare or --concat, not both." >&2
+    exit 1
+  fi
+  concat_active="1"
+  if [[ -n "$end" && -n "$duration" ]]; then
+    echo "Use either --end or --duration, not both." >&2
+    exit 1
+  fi
+  if [[ -n "$end" ]]; then
+    duration="$(positive_difference "$end" "${start:-0}" "Input")"
+    end=""
+  fi
 fi
 
 escape_drawtext() {
@@ -305,11 +377,23 @@ if [[ -n "$start" ]]; then
   ffmpeg_args+=(-ss "$start")
 fi
 
-if [[ -n "$compare_input" && -n "$duration" ]]; then
+if [[ ( -n "$compare_input" || -n "$concat_active" ) && -n "$duration" ]]; then
   ffmpeg_args+=(-t "$duration")
 fi
 
 ffmpeg_args+=(-i "$input")
+
+if [[ -n "$concat_active" ]]; then
+  for index in "${!concat_inputs[@]}"; do
+    if [[ -n "${concat_starts[$index]}" ]]; then
+      ffmpeg_args+=(-ss "${concat_starts[$index]}")
+    fi
+    if [[ -n "${concat_durations[$index]}" ]]; then
+      ffmpeg_args+=(-t "${concat_durations[$index]}")
+    fi
+    ffmpeg_args+=(-i "${concat_inputs[$index]}")
+  done
+fi
 
 if [[ -n "$compare_input" ]]; then
   if [[ -n "$compare_start" ]]; then
@@ -327,7 +411,7 @@ if [[ -n "$end" ]]; then
   ffmpeg_args+=(-to "$end")
 fi
 
-if [[ -n "$duration" && -z "$compare_input" ]]; then
+if [[ -n "$duration" && -z "$compare_input" && -z "$concat_active" ]]; then
   ffmpeg_args+=(-t "$duration")
 fi
 
@@ -386,6 +470,77 @@ elif [[ -n "$compare_input" ]]; then
     -movflags +faststart
     "$output"
   )
+elif [[ -n "$concat_active" ]]; then
+  all_inputs=("$input" "${concat_inputs[@]}")
+  target_w="${width:-}"
+  target_h="${height:-}"
+  source_w=""
+  source_h=""
+  if [[ -z "$target_w" || -z "$target_h" ]]; then
+    source_w="$(probe_dimension "$input" width)"
+    source_h="$(probe_dimension "$input" height)"
+  fi
+  if [[ -z "$target_w" ]]; then
+    target_w="$source_w"
+  fi
+  if [[ -z "$target_h" ]]; then
+    if [[ -n "$width" && -n "$source_w" && -n "$source_h" ]]; then
+      target_h=$(( source_h * target_w / source_w ))
+    else
+      target_h="${source_h:-720}"
+    fi
+  fi
+  target_w="$(make_even "$target_w")"
+  target_h="$(make_even "$target_h")"
+  join_fps="${fps:-30}"
+
+  video_chains=()
+  audio_chains=()
+  every_input_has_audio="1"
+  for index in "${!all_inputs[@]}"; do
+    video_chain="scale=${target_w}:${target_h}:force_original_aspect_ratio=decrease,pad=${target_w}:${target_h}:(ow-iw)/2:(oh-ih)/2:color=black"
+    video_chain+=",fps=${join_fps}"
+    video_chains+=("[${index}:v:0]${video_chain},setsar=1,format=yuv420p,setpts=PTS-STARTPTS[v${index}]")
+    if has_audio "${all_inputs[$index]}"; then
+      audio_chains+=("[${index}:a:0]aresample=async=1:first_pts=0,aformat=sample_rates=48000:channel_layouts=stereo,asetpts=PTS-STARTPTS[a${index}]")
+    else
+      every_input_has_audio=""
+    fi
+  done
+
+  concat_inputs_filter=""
+  for index in "${!all_inputs[@]}"; do
+    concat_inputs_filter+="[v${index}]"
+    if [[ -n "$every_input_has_audio" ]]; then
+      concat_inputs_filter+="[a${index}]"
+    fi
+  done
+  if [[ -n "$every_input_has_audio" ]]; then
+    concat_filter="${concat_inputs_filter}concat=n=${#all_inputs[@]}:v=1:a=1[vout_pre][aout]"
+  else
+    concat_filter="${concat_inputs_filter}concat=n=${#all_inputs[@]}:v=1:a=0[vout_pre]"
+  fi
+  filter_complex="$(IFS=';'; echo "${video_chains[*]}"; if [[ -n "$every_input_has_audio" ]]; then printf ';%s' "$(IFS=';'; echo "${audio_chains[*]}")"; fi; printf ';%s' "$concat_filter")"
+  if [[ -n "$text" ]]; then
+    filter_complex+=";[vout_pre]$(caption_filter "$text" "$text_position" "$text_size")[vout]"
+    video_output_label="vout"
+  else
+    video_output_label="vout_pre"
+  fi
+  ffmpeg_args+=(
+    -filter_complex "$filter_complex"
+    -map "[${video_output_label}]"
+    -c:v libx264
+    -preset "$preset"
+    -crf "$crf"
+    -pix_fmt yuv420p
+  )
+  if [[ -n "$every_input_has_audio" ]]; then
+    ffmpeg_args+=(-map "[aout]" -c:a aac -b:a 160k)
+  else
+    ffmpeg_args+=(-an)
+  fi
+  ffmpeg_args+=(-movflags +faststart "$output")
 else
   if [[ ${#vf_parts[@]} -gt 0 ]]; then
     vf_chain="$(IFS=,; echo "${vf_parts[*]}")"

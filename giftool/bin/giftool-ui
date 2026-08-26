@@ -304,7 +304,19 @@ class TrimTool:
 
         self.info: MediaInfo | None = None
         self.compare_info: MediaInfo | None = None
+        self.join_paths: list[Path] = []
+        self.join_infos: list[MediaInfo] = []
+        self.join_start_times: list[float] = []
+        self.join_end_times: list[float] = []
+        self.join_scrub_times: list[float] = []
+        self.join_video_preview_paths: list[Path | None] = []
         self.compare_enabled = False
+        self.join_enabled = False
+        self.join_preview_path: Path | None = None
+        self.previewing_join = False
+        self.join_revision = 0
+        self.join_trim_syncing = False
+        self.join_selected_index = 0
         self.output_path: Path | None = None
         self.start_time = 0.0
         self.end_time = 0.0
@@ -327,16 +339,21 @@ class TrimTool:
         self.compare_trim_event_guard_until = 0.0
         self.pending_scrub_updates: list[tuple[float, float]] = []
         self.pending_compare_scrub_updates: list[tuple[float, float]] = []
+        self.join_upload_lock = asyncio.Lock()
 
         self.path_input = None
         self.compare_path_input = None
+        self.join_paths_input = None
         self.source_upload = None
         self.compare_upload = None
+        self.join_upload = None
+        self.join_preview_button = None
         self.output_input = None
         self.save_copy_input = None
         self.status = None
         self.meta = None
         self.compare_meta = None
+        self.join_meta = None
         self.trim_label = None
         self.command_label = None
         self.output_meta = None
@@ -346,6 +363,8 @@ class TrimTool:
         self.save_copy_button = None
         self.source_video = None
         self.compare_video = None
+        self.join_videos: dict[int, Any] = {}
+        self.join_trim_controls: dict[int, dict[str, Any]] = {}
         self.gif_frame_image = None
         self.start_slider = None
         self.end_slider = None
@@ -372,6 +391,7 @@ class TrimTool:
         self.preset_select = None
         self.copy_checkbox = None
         self.side_by_side_checkbox = None
+        self.combine_checkbox = None
         self.caption_input = None
         self.text_position_select = None
         self.text_size_input = None
@@ -611,7 +631,7 @@ class TrimTool:
 
     def source_panel(self) -> None:
         with ui.column().classes("panel gap-4"):
-            ui.label("Source").classes("section-title")
+            ui.label("Single Source").classes("section-title")
             self.source_upload = ui.upload(on_upload=self.handle_upload, auto_upload=True).props(
                 'accept=".gif,.mp4,.m4v,.mov,.webm,video/*,image/gif"'
             ).classes("hidden")
@@ -647,6 +667,29 @@ class TrimTool:
                 ui.button("Clear", icon="close", on_click=self.clear_compare).props("outline").classes("grow")
             self.compare_meta = ui.column().classes("gap-1 w-full")
             self.refresh_compare_meta()
+
+            ui.separator()
+            ui.label("Combine Clips").classes("section-title")
+            self.join_upload = ui.upload(on_upload=self.handle_join_upload, auto_upload=True).props(
+                'multiple accept=".gif,.mp4,.m4v,.mov,.webm,video/*,image/gif"'
+            ).classes("hidden")
+            self.join_paths_input = ui.textarea("Clip paths (one per line)").props(
+                "outlined dense clearable"
+            ).classes("w-full")
+            with ui.row().classes("w-full gap-2"):
+                ui.button("Add Files", icon="playlist_add").props("outline").classes("grow").on(
+                    "click",
+                    js_handler=f'() => runMethod({self.join_upload.id}, "pickFiles", [])',
+                )
+                ui.button("Load Paths", icon="folder_open", on_click=self.load_join_paths_from_input).props(
+                    "outline"
+                ).classes("grow")
+                ui.button("Clear", icon="close", on_click=self.clear_join).props("outline").classes("grow")
+            self.join_preview_button = ui.button(
+                "Preview Join", icon="play_circle", on_click=self.preview_join
+            ).props("outline disabled").classes("w-full")
+            self.join_meta = ui.column().classes("gap-1 w-full")
+            self.refresh_join_meta()
 
             ui.separator()
             self.output_input = ui.input("Output path").props("outlined dense").classes("w-full")
@@ -694,13 +737,18 @@ class TrimTool:
         self.compare_start_input = None
         self.compare_end_input = None
         self.compare_scrub_input = None
+        self.join_videos = {}
+        self.join_trim_controls = {}
         with ui.column().classes("panel gap-4"):
             with ui.row().classes("items-center justify-between w-full"):
                 ui.label("Preview").classes("section-title")
-                if self.info is not None:
-                    ui.label(self.info.path.name).classes("muted")
+                preview_info = self.output_info()
+                if preview_info is not None:
+                    ui.label(preview_info.path.name).classes("muted")
 
-            if self.info is None:
+            if self.join_active():
+                self.join_clip_preview_tabs()
+            elif self.info is None:
                 with ui.element("div").classes("preview-surface"):
                     with ui.column().classes("empty-preview items-center gap-2"):
                         ui.icon("movie").classes("text-5xl")
@@ -716,6 +764,18 @@ class TrimTool:
                         self.compare_preview_tab()
             else:
                 self.source_preview_tab()
+
+            if self.join_preview_path:
+                ui.label("Join Preview").classes("section-title")
+                with ui.element("div").classes("preview-surface"):
+                    join_video = ui.video(self.join_preview_path).props("controls preload=metadata muted").classes(
+                        "media-view"
+                    )
+                    join_video.on(
+                        "error",
+                        self.on_output_media_error,
+                        js_handler=f"() => emit(window.giftoolRecoverMedia({join_video.id}))",
+                    )
 
             if self.output_path:
                 ui.label("Rendered Output").classes("section-title")
@@ -828,6 +888,237 @@ class TrimTool:
                         throttle=0.1,
                     )
             self.compare_trim_controls()
+
+    def join_clip_preview_tabs(self) -> None:
+        if not self.join_infos:
+            return
+        self.join_selected_index = min(self.join_selected_index, len(self.join_infos) - 1)
+        options = {index: f"{index + 1}. {info.path.name}" for index, info in enumerate(self.join_infos)}
+        ui.select(
+            options,
+            value=self.join_selected_index,
+            label="Clip to preview and trim",
+            on_change=lambda e: self.select_join_clip(int(e.value)),
+        ).props("outlined dense").classes("w-full")
+        self.join_clip_preview_tab(self.join_selected_index)
+
+    def select_join_clip(self, index: int) -> None:
+        if index < 0 or index >= len(self.join_infos) or index == self.join_selected_index:
+            return
+        self.join_selected_index = index
+        self.preview_panel.refresh()
+
+    def join_clip_preview_tab(self, index: int) -> None:
+        info = self.join_infos[index]
+        duration = max(0.01, info.duration)
+        start = max(0.0, min(self.join_start_times[index], duration))
+        end = max(start, min(self.join_end_times[index], duration))
+        scrub = max(start, min(self.join_scrub_times[index], end))
+        with ui.column().classes("preview-tab-content gap-4"):
+            with ui.element("div").classes("preview-surface"):
+                preview_path = self.join_video_preview_paths[index]
+                if info.kind == "gif" and preview_path is None:
+                    self.gif_preview(info.path)
+                else:
+                    video_path = preview_path if preview_path is not None else info.path
+                    video = ui.video(video_path).props("controls preload=metadata muted").classes("media-view")
+                    self.join_videos[index] = video
+                    video.on(
+                        "error",
+                        self.on_output_media_error,
+                        js_handler=f"() => emit(window.giftoolRecoverMedia({video.id}))",
+                    )
+                    video.on(
+                        "timeupdate",
+                        lambda e, i=index: self.on_join_time_update(i, e),
+                        js_handler="(event) => emit(event.target.currentTime)",
+                        throttle=0.2,
+                    )
+
+            with ui.column().classes("trim-controls gap-3"):
+                ui.label(f"Trim clip {index + 1}").classes("section-title")
+                label = ui.label(self.join_trim_text(index)).classes("muted")
+                start_slider = ui.slider(
+                    min=0.0,
+                    max=duration,
+                    value=start,
+                    step=0.01,
+                    on_change=lambda e, i=index: self.set_join_clip_start(i, e.value),
+                ).props("label-always")
+                end_slider = ui.slider(
+                    min=0.0,
+                    max=duration,
+                    value=end,
+                    step=0.01,
+                    on_change=lambda e, i=index: self.set_join_clip_end(i, e.value),
+                ).props("label-always")
+                with ui.row().classes("w-full gap-2"):
+                    start_input = ui.number(
+                        "Start",
+                        value=round(start, 3),
+                        min=0.0,
+                        max=duration,
+                        step=0.1,
+                        on_change=lambda e, i=index: self.set_join_clip_start(i, e.value),
+                    ).props("outlined dense suffix=s").classes("grow")
+                    end_input = ui.number(
+                        "End",
+                        value=round(end, 3),
+                        min=0.0,
+                        max=duration,
+                        step=0.1,
+                        on_change=lambda e, i=index: self.set_join_clip_end(i, e.value),
+                    ).props("outlined dense suffix=s").classes("grow")
+                ui.label("Preview Position").classes("section-title")
+                scrub_slider = ui.slider(
+                    min=start,
+                    max=end,
+                    value=scrub,
+                    step=0.01,
+                    on_change=lambda e, i=index: self.set_join_clip_scrub(i, e.value),
+                ).props("label-always")
+                scrub_input = ui.number(
+                    "Scrub",
+                    value=round(scrub, 3),
+                    min=start,
+                    max=end,
+                    step=0.1,
+                    on_change=lambda e, i=index: self.set_join_clip_scrub(i, e.value),
+                ).props("outlined dense suffix=s").classes("w-full")
+                with ui.row().classes("w-full gap-2"):
+                    ui.button(
+                        "Play Selected", icon="play_arrow", on_click=lambda i=index: self.play_join_clip(i)
+                    ).props("unelevated").classes("grow")
+                    ui.button(
+                        "Loop Selected", icon="repeat", on_click=lambda i=index: self.play_join_clip(i, loop=True)
+                    ).props("outline").classes("grow")
+                    ui.button("Pause", icon="pause", on_click=lambda i=index: self.pause_join_clip(i)).props(
+                        "outline"
+                    ).classes("grow")
+                    ui.button("Full Range", icon="select_all", on_click=lambda i=index: self.full_join_clip(i)).props(
+                        "outline"
+                    ).classes("grow")
+                self.join_trim_controls[index] = {
+                    "label": label,
+                    "start_slider": start_slider,
+                    "end_slider": end_slider,
+                    "start_input": start_input,
+                    "end_input": end_input,
+                    "scrub_slider": scrub_slider,
+                    "scrub_input": scrub_input,
+                }
+
+    def join_trim_text(self, index: int) -> str:
+        selected = max(0.0, self.join_end_times[index] - self.join_start_times[index])
+        return (
+            f"{format_seconds(self.join_start_times[index])} to "
+            f"{format_seconds(self.join_end_times[index])} ({format_seconds(selected)})"
+        )
+
+    def sync_join_trim_controls(self, index: int) -> None:
+        controls = self.join_trim_controls.get(index)
+        if controls is None:
+            return
+        self.join_trim_syncing = True
+        try:
+            start = self.join_start_times[index]
+            end = self.join_end_times[index]
+            scrub = self.join_scrub_times[index]
+            controls["start_slider"].set_value(start)
+            controls["end_slider"].set_value(end)
+            controls["start_input"].set_value(round(start, 3))
+            controls["end_input"].set_value(round(end, 3))
+            controls["scrub_slider"].props["min"] = start
+            controls["scrub_slider"].props["max"] = end
+            controls["scrub_input"].props["min"] = start
+            controls["scrub_input"].props["max"] = end
+            controls["scrub_slider"].set_value(scrub)
+            controls["scrub_input"].set_value(round(scrub, 3))
+            controls["label"].set_text(self.join_trim_text(index))
+        finally:
+            self.join_trim_syncing = False
+
+    def join_trim_changed(self, index: int) -> None:
+        self.join_revision += 1
+        self.invalidate_rendered_join_output()
+        self.sync_join_trim_controls(index)
+        self.refresh_join_meta()
+
+    def set_join_clip_start(self, index: int, value: Any) -> None:
+        if self.join_trim_syncing or index >= len(self.join_infos):
+            return
+        duration = max(0.0, self.join_infos[index].duration)
+        start = max(0.0, min(parse_number(value), duration))
+        self.join_start_times[index] = start
+        if self.join_end_times[index] < start:
+            self.join_end_times[index] = start
+        self.join_scrub_times[index] = max(start, min(self.join_scrub_times[index], self.join_end_times[index]))
+        self.join_trim_changed(index)
+
+    def set_join_clip_end(self, index: int, value: Any) -> None:
+        if self.join_trim_syncing or index >= len(self.join_infos):
+            return
+        duration = max(0.0, self.join_infos[index].duration)
+        end = max(0.0, min(parse_number(value), duration))
+        self.join_end_times[index] = end
+        if self.join_start_times[index] > end:
+            self.join_start_times[index] = end
+        self.join_scrub_times[index] = max(self.join_start_times[index], min(self.join_scrub_times[index], end))
+        self.join_trim_changed(index)
+
+    async def set_join_clip_scrub(self, index: int, value: Any) -> None:
+        if self.join_trim_syncing or index >= len(self.join_infos):
+            return
+        start = self.join_start_times[index]
+        end = self.join_end_times[index]
+        scrub = max(start, min(parse_number(value), end))
+        if abs(scrub - self.join_scrub_times[index]) < 0.03:
+            return
+        self.join_scrub_times[index] = scrub
+        self.sync_join_trim_controls(index)
+        video = self.join_videos.get(index)
+        if video is not None:
+            await self.run_preview_script(f"return window.giftoolSeekTrim({video.id}, {scrub:.6f})")
+
+    def on_join_time_update(self, index: int, event: events.GenericEventArguments) -> None:
+        if index >= len(self.join_infos):
+            return
+        raw_value = event.args[0] if isinstance(event.args, list) and event.args else event.args
+        start = self.join_start_times[index]
+        end = self.join_end_times[index]
+        self.join_scrub_times[index] = max(start, min(parse_number(raw_value, start), end))
+        self.sync_join_trim_controls(index)
+
+    async def play_join_clip(self, index: int, loop: bool = False) -> None:
+        video = self.join_videos.get(index)
+        if video is None:
+            ui.notify("This clip does not have a playable video preview.", type="warning")
+            return
+        start = self.join_start_times[index]
+        end = self.join_end_times[index]
+        if end <= start:
+            ui.notify("Clip end time must be greater than start time.", type="warning")
+            return
+        preview_start = self.join_scrub_times[index] if start <= self.join_scrub_times[index] < end else start
+        ok = await self.run_preview_script(
+            "return window.giftoolPlayTrim("
+            f"{video.id}, {preview_start:.6f}, {end:.6f}, {str(loop).lower()}, {start:.6f})"
+        )
+        if not ok:
+            ui.notify("Could not start the clip preview.", type="negative")
+
+    async def pause_join_clip(self, index: int) -> None:
+        video = self.join_videos.get(index)
+        if video is not None:
+            await self.run_preview_script(f"return window.giftoolPauseTrim({video.id})")
+
+    def full_join_clip(self, index: int) -> None:
+        if index >= len(self.join_infos):
+            return
+        self.join_start_times[index] = 0.0
+        self.join_end_times[index] = self.join_infos[index].duration
+        self.join_scrub_times[index] = 0.0
+        self.join_trim_changed(index)
 
     def source_trim_controls(self) -> None:
         duration = max(0.01, self.info.duration if self.info else 1.0)
@@ -996,11 +1287,13 @@ class TrimTool:
         self.text_position_select = None
         self.text_size_input = None
         self.side_by_side_checkbox = None
+        self.combine_checkbox = None
         self.label_left_input = None
         self.label_right_input = None
         self.crf_slider = None
         self.preset_select = None
         self.copy_checkbox = None
+        active_info = self.output_info()
 
         with ui.column().classes("panel gap-4"):
             ui.label("Output").classes("section-title")
@@ -1035,25 +1328,36 @@ class TrimTool:
                     on_change=lambda e: self.set_output_scale(e.value),
                 ).props("outlined dense suffix=%").classes("w-24")
             self.output_size_label = ui.label("Output: -").classes("muted")
-            if self.info is not None:
+            if active_info is not None:
                 self.output_format_select = ui.select(
                     {"auto": "Auto", "gif": "GIF", "mp4": "MP4"},
                     value=self.output_format_select_value(),
                     label="Output format",
                     on_change=lambda e: self.set_output_format(e.value),
                 ).props("outlined dense").classes("w-full")
-                if self.side_by_side_active():
+                if self.side_by_side_active() or self.join_active():
                     self.output_format_select.disable()
             self.fps_input = ui.input("FPS").props("outlined dense").classes("w-full")
 
-            compare_ready = self.info is not None and self.compare_info is not None
+            compare_ready = self.info is not None and self.compare_info is not None and not self.join_active()
+            join_ready = bool(self.join_paths)
             mp4_output = self.mp4_output_active()
 
-            if self.info is None or (self.info.kind == "gif" and not mp4_output):
+            if active_info is None or (active_info.kind == "gif" and not mp4_output):
                 self.loop_input = ui.input("Loop count").props("outlined dense").classes("w-full")
                 self.loop_input.set_value("0")
 
-            if self.info is not None and (self.info.kind == "video" or compare_ready):
+            if join_ready:
+                ui.separator()
+                ui.label("Joining").classes("section-title")
+                self.combine_checkbox = ui.checkbox(
+                    "Combine clips in order",
+                    value=bool(self.join_enabled),
+                    on_change=lambda e: self.set_join_enabled(e.value),
+                )
+                ui.label("The ordered clip list is the source; each clip has its own trim controls.").classes("muted")
+
+            if self.info is not None and not self.join_active() and (self.info.kind == "video" or compare_ready):
                 ui.separator()
                 ui.label("Comparison").classes("section-title")
                 self.side_by_side_checkbox = ui.checkbox(
@@ -1093,13 +1397,19 @@ class TrimTool:
                     label="H.264 preset",
                 ).props("outlined dense").classes("w-full")
                 self.copy_checkbox = ui.checkbox("Fast copy mode")
-                if (self.info.kind != "video" or self.side_by_side_active()) and self.copy_checkbox is not None:
+                if (
+                    active_info is None
+                    or active_info.kind != "video"
+                    or self.side_by_side_active()
+                    or self.join_active()
+                ) and self.copy_checkbox is not None:
                     self.copy_checkbox.disable()
 
             self.render_button = ui.button("Render Output", icon="content_cut", on_click=self.render).props(
                 "unelevated"
             ).classes("w-full")
-            self.status = ui.label("Load a GIF or video to begin.").classes("muted")
+            status_text = "Ready to preview or render." if active_info is not None else "Load clips to begin."
+            self.status = ui.label(status_text).classes("muted")
             self.command_label = ui.label("").classes("command-box w-full")
 
             self.apply_source_defaults()
@@ -1110,7 +1420,10 @@ class TrimTool:
         self.meta.clear()
         with self.meta:
             if self.info is None:
-                ui.label("No source loaded.").classes("muted")
+                if self.join_active():
+                    ui.label(f"Using {len(self.join_infos)} clips as the join source.").classes("muted")
+                else:
+                    ui.label("No single source loaded. You can use Combine Clips instead.").classes("muted")
                 return
             rows = [
                 ("Type", "GIF" if self.info.kind == "gif" else "Video"),
@@ -1148,17 +1461,127 @@ class TrimTool:
                     ui.label(label).classes("muted")
                     ui.label(value)
 
+    def refresh_join_meta(self) -> None:
+        if self.join_meta is None:
+            return
+        self.join_meta.clear()
+        with self.join_meta:
+            if not self.join_infos:
+                ui.label("No clips loaded.").classes("muted")
+            else:
+                ui.label("Clips play top-to-bottom. Use the Preview panel to trim each one.").classes("muted")
+            for index, info in enumerate(self.join_infos, start=1):
+                selected = max(0.0, self.join_end_times[index - 1] - self.join_start_times[index - 1])
+                with ui.row().classes("items-center w-full gap-1"):
+                    ui.label(f"{index}. {info.path.name} ({format_seconds(selected)} selected)").classes("grow")
+                    up_button = ui.button(
+                        icon="arrow_upward", on_click=lambda i=index - 1: self.move_join_clip(i, -1)
+                    ).props("flat dense")
+                    down_button = ui.button(
+                        icon="arrow_downward", on_click=lambda i=index - 1: self.move_join_clip(i, 1)
+                    ).props("flat dense")
+                    ui.button(icon="close", on_click=lambda i=index - 1: self.remove_join_clip(i)).props(
+                        "flat dense"
+                    )
+                    ui.button(icon="edit", on_click=lambda i=index - 1: self.select_join_clip(i)).props("flat dense")
+                    if index == 1:
+                        up_button.disable()
+                    if index == len(self.join_infos):
+                        down_button.disable()
+        if self.join_preview_button:
+            if self.join_paths and not self.loading and not self.previewing_join:
+                self.join_preview_button.enable()
+            else:
+                self.join_preview_button.disable()
+
+    def invalidate_join_preview(self) -> None:
+        if self.join_preview_path is not None:
+            self.join_preview_path.unlink(missing_ok=True)
+        self.join_preview_path = None
+
+    def invalidate_rendered_join_output(self) -> None:
+        self.invalidate_join_preview()
+        self.output_path = None
+        if self.output_meta:
+            self.output_meta.set_text("No output rendered.")
+        self.set_output_buttons(False)
+
+    def move_join_clip(self, index: int, direction: int) -> None:
+        next_index = index + direction
+        if index < 0 or next_index < 0 or next_index >= len(self.join_paths):
+            return
+        self.join_revision += 1
+        self.join_paths[index], self.join_paths[next_index] = self.join_paths[next_index], self.join_paths[index]
+        self.join_infos[index], self.join_infos[next_index] = self.join_infos[next_index], self.join_infos[index]
+        self.join_start_times[index], self.join_start_times[next_index] = (
+            self.join_start_times[next_index], self.join_start_times[index]
+        )
+        self.join_end_times[index], self.join_end_times[next_index] = (
+            self.join_end_times[next_index], self.join_end_times[index]
+        )
+        self.join_scrub_times[index], self.join_scrub_times[next_index] = (
+            self.join_scrub_times[next_index], self.join_scrub_times[index]
+        )
+        self.join_video_preview_paths[index], self.join_video_preview_paths[next_index] = (
+            self.join_video_preview_paths[next_index], self.join_video_preview_paths[index]
+        )
+        if self.join_selected_index == index:
+            self.join_selected_index = next_index
+        elif self.join_selected_index == next_index:
+            self.join_selected_index = index
+        if self.join_paths_input:
+            self.join_paths_input.set_value("\n".join(str(path) for path in self.join_paths))
+        self.invalidate_rendered_join_output()
+        output_info = self.output_info()
+        if self.output_input:
+            self.output_input.set_value(str(self.default_output_path(output_info)) if output_info is not None else "")
+        self.refresh_join_meta()
+        self.preview_panel.refresh()
+        self.set_status("Join order updated.")
+
+    def remove_join_clip(self, index: int) -> None:
+        if index < 0 or index >= len(self.join_paths):
+            return
+        self.join_revision += 1
+        self.join_paths.pop(index)
+        self.join_infos.pop(index)
+        self.join_start_times.pop(index)
+        self.join_end_times.pop(index)
+        self.join_scrub_times.pop(index)
+        self.join_video_preview_paths.pop(index)
+        if self.join_selected_index > index:
+            self.join_selected_index -= 1
+        self.join_selected_index = min(self.join_selected_index, max(0, len(self.join_paths) - 1))
+        self.join_enabled = bool(self.join_paths)
+        if self.join_paths_input:
+            self.join_paths_input.set_value("\n".join(str(path) for path in self.join_paths))
+        self.invalidate_rendered_join_output()
+        output_info = self.output_info()
+        if self.output_input:
+            self.output_input.set_value(str(self.default_output_path(output_info)) if output_info is not None else "")
+        self.refresh_join_meta()
+        self.preview_panel.refresh()
+        self.controls_panel.refresh()
+        self.set_status("Clip removed from join order.")
+
+    def output_info(self) -> MediaInfo | None:
+        if self.join_active() and self.join_infos:
+            return self.join_infos[0]
+        return self.info
+
     def output_base_size(self) -> tuple[int, int] | None:
-        if self.info is None:
+        info = self.output_info()
+        if info is None:
             return None
         if self.side_by_side_active():
             return 1920, 1080
-        if self.info.width and self.info.height:
-            return int(self.info.width), int(self.info.height)
+        if info.width and info.height:
+            return int(info.width), int(info.height)
         return None
 
     def normalize_output_dimension(self, value: float) -> int:
-        if self.info is not None and self.info.kind == "video":
+        info = self.output_info()
+        if info is not None and info.kind == "video":
             return max(2, int(round(value / 2.0) * 2))
         return max(1, int(round(value)))
 
@@ -1223,13 +1646,14 @@ class TrimTool:
         self.set_output_dimensions(dimensions[0], dimensions[1], percent)
 
     def apply_source_defaults(self) -> None:
-        if self.info is None:
+        info = self.output_info()
+        if info is None:
             return
         base_size = self.output_base_size()
         if base_size is not None:
             self.set_output_dimensions(base_size[0], base_size[1], 100.0)
-        if self.fps_input and self.info.fps:
-            self.fps_input.set_value(f"{self.info.fps:.2f}".rstrip("0").rstrip("."))
+        if self.fps_input and info.fps:
+            self.fps_input.set_value(f"{info.fps:.2f}".rstrip("0").rstrip("."))
 
     def set_status(self, message: str) -> None:
         if self.status:
@@ -1242,8 +1666,10 @@ class TrimTool:
         for control in (
             self.source_upload,
             self.compare_upload,
+            self.join_upload,
             self.path_input,
             self.compare_path_input,
+            self.join_paths_input,
             self.render_button,
         ):
             if control is None:
@@ -1252,28 +1678,35 @@ class TrimTool:
                 control.disable()
             else:
                 control.enable()
+        if self.join_preview_button:
+            if not loading and self.join_paths and not self.previewing_join:
+                self.join_preview_button.enable()
+            else:
+                self.join_preview_button.disable()
 
     def output_format_select_value(self) -> str:
-        if self.side_by_side_active():
+        if self.side_by_side_active() or self.join_active():
             return "mp4"
         return self.output_format
 
     def target_output_kind(self) -> str:
-        if self.info is None:
-            return "gif"
-        if self.side_by_side_active():
+        if self.join_active() or self.side_by_side_active():
             return "mp4"
+        info = self.output_info()
+        if info is None:
+            return "gif"
         if self.output_format in {"gif", "mp4"}:
             return self.output_format
-        return self.info.kind
+        return info.kind
 
     def set_output_format(self, value: Any) -> None:
         next_format = str(value or "auto")
         if next_format not in {"auto", "gif", "mp4"}:
             next_format = "auto"
         self.output_format = next_format
-        if self.output_input and self.info is not None:
-            self.output_input.set_value(str(self.default_output_path(self.info)))
+        info = self.output_info()
+        if self.output_input:
+            self.output_input.set_value(str(self.default_output_path(info)) if info is not None else "")
         self.apply_source_defaults()
         self.controls_panel.refresh()
 
@@ -1309,6 +1742,12 @@ class TrimTool:
             kept.append((pending_value, created_at))
         queue[:] = kept[-20:]
         return matched
+
+    async def run_preview_script(self, script: str) -> Any:
+        try:
+            return await ui.run_javascript(script, timeout=2)
+        except Exception:
+            return False
 
     async def handle_upload(self, event: events.UploadEventArguments) -> None:
         if self.loading:
@@ -1350,6 +1789,27 @@ class TrimTool:
         finally:
             self.set_loading_state(False)
 
+    async def handle_join_upload(self, event: events.UploadEventArguments) -> None:
+        async with self.join_upload_lock:
+            if self.loading:
+                ui.notify("Another file is still loading.", type="warning")
+                return
+            filename = clean_filename(event.file.name)
+            suffix = Path(filename).suffix.lower()
+            if suffix not in ACCEPTED_SUFFIXES:
+                ui.notify("Use GIF or video files for joining.", type="negative")
+                return
+
+            target = UPLOAD_DIR / f"{Path(filename).stem}-{secrets.token_hex(4)}{suffix}"
+            self.set_loading_state(True, f"Uploading {filename}...")
+            ui.notify(f"Uploading {filename}...", type="info")
+            await asyncio.sleep(0)
+            try:
+                await event.file.save(target)
+                await self.load_join_paths([*self.join_paths, target], already_loading=True)
+            finally:
+                self.set_loading_state(False)
+
     async def load_path(self) -> None:
         if self.loading:
             ui.notify("Another file is still loading.", type="warning")
@@ -1370,6 +1830,106 @@ class TrimTool:
             ui.notify("Enter a second media path.", type="warning")
             return
         await self.load_compare_media(Path(raw_path).expanduser())
+
+    async def load_join_paths_from_input(self) -> None:
+        if self.loading:
+            ui.notify("Another file is still loading.", type="warning")
+            return
+        raw_paths = self.join_paths_input.value if self.join_paths_input else ""
+        paths = [Path(line.strip()).expanduser() for line in str(raw_paths or "").splitlines() if line.strip()]
+        if not paths:
+            self.clear_join()
+            return
+        await self.load_join_paths(paths)
+
+    async def load_join_paths(self, paths: list[Path], *, already_loading: bool = False) -> None:
+        paths = [path.expanduser() for path in paths]
+        if not self.join_paths and self.info is not None and self.info.path not in paths:
+            paths.insert(0, self.info.path)
+        managed_loading = not already_loading and not self.loading
+        if managed_loading:
+            self.set_loading_state(True, "Loading clips to combine...")
+        await asyncio.sleep(0)
+        try:
+            if not paths:
+                self.clear_join()
+                return
+            for path in paths:
+                if not path.exists() or not path.is_file():
+                    raise ValueError(f"Join file was not found: {path}")
+
+            existing: dict[Path, list[tuple[float, float, float, Path | None]]] = {}
+            for index, old_path in enumerate(self.join_paths):
+                existing.setdefault(old_path, []).append(
+                    (
+                        self.join_start_times[index],
+                        self.join_end_times[index],
+                        self.join_scrub_times[index],
+                        self.join_video_preview_paths[index],
+                    )
+                )
+
+            infos: list[MediaInfo] = []
+            start_times: list[float] = []
+            end_times: list[float] = []
+            scrub_times: list[float] = []
+            video_preview_paths: list[Path | None] = []
+            for path in paths:
+                self.set_status(f"Reading metadata for {path.name}...")
+                info = await asyncio.to_thread(probe_media, path)
+                infos.append(info)
+                preserved = existing.get(path, [])
+                if preserved:
+                    start, end, scrub, video_preview_path = preserved.pop(0)
+                    start_times.append(max(0.0, min(start, info.duration)))
+                    end_times.append(max(start_times[-1], min(end, info.duration)))
+                    scrub_times.append(max(start_times[-1], min(scrub, end_times[-1])))
+                    video_preview_paths.append(video_preview_path)
+                else:
+                    start_times.append(0.0)
+                    end_times.append(info.duration if info.duration > 0 else 1.0)
+                    scrub_times.append(0.0)
+                    video_preview_path = None
+                    if info.kind == "gif":
+                        self.set_status(f"Preparing preview for {path.name}...")
+                        try:
+                            video_preview_path = await asyncio.to_thread(ensure_gif_video_preview, path)
+                        except Exception as exc:
+                            ui.notify(f"Could not prepare GIF video preview for {path.name}: {exc}", type="warning")
+                    video_preview_paths.append(video_preview_path)
+
+            self.join_paths = paths
+            self.join_infos = infos
+            self.join_start_times = start_times
+            self.join_end_times = end_times
+            self.join_scrub_times = scrub_times
+            self.join_video_preview_paths = video_preview_paths
+            self.join_revision += 1
+            self.join_enabled = bool(paths)
+            self.compare_enabled = False
+            self.invalidate_rendered_join_output()
+            if self.join_paths_input:
+                self.join_paths_input.set_value("\n".join(str(path) for path in paths))
+            output_info = self.output_info()
+            if self.output_input and output_info is not None:
+                self.output_input.set_value(str(self.default_output_path(output_info)))
+            if self.save_copy_input:
+                self.save_copy_input.set_value("")
+            if self.output_meta:
+                self.output_meta.set_text("No output rendered.")
+            self.set_output_buttons(False)
+            self.refresh_meta()
+            self.refresh_join_meta()
+            self.preview_panel.refresh()
+            self.controls_panel.refresh()
+            self.set_status(f"Loaded {len(paths)} clip{'s' if len(paths) != 1 else ''} for the join source.")
+            ui.notify(f"Loaded {len(paths)} clip{'s' if len(paths) != 1 else ''} to combine", type="positive")
+        except Exception as exc:
+            ui.notify(f"Could not load clips to combine: {exc}", type="negative")
+            self.set_status("Could not load clips to combine.")
+        finally:
+            if managed_loading:
+                self.set_loading_state(False)
 
     async def load_media(self, path: Path) -> None:
         path = path.expanduser()
@@ -1396,8 +1956,9 @@ class TrimTool:
 
         try:
             self.info = info
-            self.output_path = None
-            self.compare_enabled = self.compare_info is not None
+            self.join_revision += 1
+            self.invalidate_rendered_join_output()
+            self.compare_enabled = self.compare_info is not None and not self.join_paths
             self.output_format = "auto"
             self.start_time = 0.0
             self.end_time = info.duration if info.duration > 0 else 1.0
@@ -1468,7 +2029,7 @@ class TrimTool:
                     self.compare_video_preview_path = await asyncio.to_thread(ensure_gif_video_preview, info.path)
                 except Exception as exc:
                     ui.notify(f"Could not prepare comparison GIF video preview: {exc}", type="warning")
-            self.compare_enabled = self.info is not None
+            self.compare_enabled = self.info is not None and not self.join_paths
             self.compare_start_time = 0.0
             self.compare_end_time = info.duration if info.duration > 0 else 1.0
             self.compare_scrub_time = 0.0
@@ -1490,6 +2051,8 @@ class TrimTool:
 
     def default_output_path(self, info: MediaInfo) -> Path:
         output_dir = self.default_output_dir(info)
+        if self.join_active():
+            return output_dir / f"{info.path.stem}-joined.mp4"
         if self.compare_info is not None and self.compare_enabled:
             return output_dir / f"{info.path.stem}-vs-{self.compare_info.path.stem}.mp4"
         suffix = ".gif" if self.target_output_kind() == "gif" else ".mp4"
@@ -1507,17 +2070,19 @@ class TrimTool:
         return videos_dir if (Path.home() / "Videos").exists() else Path.home() / "ClipFlip"
 
     def use_default_output_path(self) -> None:
-        if self.info is None:
-            ui.notify("Load a GIF or video first.", type="warning")
+        info = self.output_info()
+        if info is None:
+            ui.notify("Load clips first.", type="warning")
             return
         if self.output_input:
-            self.output_input.set_value(str(self.default_output_path(self.info)))
+            self.output_input.set_value(str(self.default_output_path(info)))
 
     def choose_output_path(self) -> None:
-        if self.info is None:
-            ui.notify("Load a GIF or video first.", type="warning")
+        info = self.output_info()
+        if info is None:
+            ui.notify("Load clips first.", type="warning")
             return
-        selected = self.ask_save_path(self.default_output_path(self.info))
+        selected = self.ask_save_path(self.default_output_path(info))
         if selected and self.output_input:
             self.output_input.set_value(selected)
 
@@ -1715,9 +2280,8 @@ class TrimTool:
             and self.source_video is not None
             and (self.info.kind == "video" or self.gif_video_preview_path is not None)
         ):
-            await ui.run_javascript(
+            await self.run_preview_script(
                 f"return window.giftoolSeekTrim({self.source_video.id}, {self.scrub_time:.6f})",
-                timeout=2,
             )
 
     def preview_start_time(self) -> float:
@@ -1733,11 +2297,10 @@ class TrimTool:
             ui.notify("End time must be greater than start time.", type="warning")
             return
         preview_start = self.preview_start_time()
-        ok = await ui.run_javascript(
+        ok = await self.run_preview_script(
             "return window.giftoolPlayTrim("
             f"{self.source_video.id}, {preview_start:.6f}, {self.end_time:.6f}, "
             f"{str(loop).lower()}, {self.start_time:.6f})",
-            timeout=2,
         )
         if not ok:
             ui.notify("Could not start the trim preview.", type="negative")
@@ -1748,7 +2311,7 @@ class TrimTool:
     async def pause_trim_preview(self) -> None:
         if self.source_video is None:
             return
-        await ui.run_javascript(f"return window.giftoolPauseTrim({self.source_video.id})", timeout=2)
+        await self.run_preview_script(f"return window.giftoolPauseTrim({self.source_video.id})")
 
     def stop_gif_playback(self) -> None:
         task = self.gif_play_task
@@ -1766,11 +2329,10 @@ class TrimTool:
 
         if self.gif_video_preview_path is not None and self.source_video is not None:
             preview_start = self.preview_start_time()
-            ok = await ui.run_javascript(
+            ok = await self.run_preview_script(
                 "return window.giftoolPlayTrim("
                 f"{self.source_video.id}, {preview_start:.6f}, {self.end_time:.6f}, "
                 f"{str(loop).lower()}, {self.start_time:.6f})",
-                timeout=2,
             )
             if not ok:
                 ui.notify("Could not start the GIF preview.", type="negative")
@@ -1789,7 +2351,7 @@ class TrimTool:
 
     async def pause_gif_preview(self) -> None:
         if self.gif_video_preview_path is not None and self.source_video is not None:
-            await ui.run_javascript(f"return window.giftoolPauseTrim({self.source_video.id})", timeout=2)
+            await self.run_preview_script(f"return window.giftoolPauseTrim({self.source_video.id})")
             return
         self.stop_gif_playback()
 
@@ -1930,9 +2492,8 @@ class TrimTool:
         self.compare_scrub_time = next_time
         self.sync_compare_scrub_controls()
         if self.compare_info is not None and self.compare_video is not None:
-            await ui.run_javascript(
+            await self.run_preview_script(
                 f"return window.giftoolSeekTrim({self.compare_video.id}, {self.compare_scrub_time:.6f})",
-                timeout=2,
             )
 
     def compare_preview_start_time(self) -> float:
@@ -1948,11 +2509,10 @@ class TrimTool:
             ui.notify("Second media end time must be greater than start time.", type="warning")
             return
         preview_start = self.compare_preview_start_time()
-        ok = await ui.run_javascript(
+        ok = await self.run_preview_script(
             "return window.giftoolPlayTrim("
             f"{self.compare_video.id}, {preview_start:.6f}, {self.compare_end_time:.6f}, "
             f"{str(loop).lower()}, {self.compare_start_time:.6f})",
-            timeout=2,
         )
         if not ok:
             ui.notify("Could not start the second trim preview.", type="negative")
@@ -1963,15 +2523,28 @@ class TrimTool:
     async def pause_compare_trim_preview(self) -> None:
         if self.compare_video is None:
             return
-        await ui.run_javascript(f"return window.giftoolPauseTrim({self.compare_video.id})", timeout=2)
+        await self.run_preview_script(f"return window.giftoolPauseTrim({self.compare_video.id})")
 
     def set_compare_enabled(self, value: Any) -> None:
         self.compare_enabled = bool(value) and self.compare_info is not None
-        if self.output_input and self.info is not None:
-            self.output_input.set_value(str(self.default_output_path(self.info)))
+        if self.compare_enabled:
+            self.join_enabled = False
+        if self.output_input:
+            self.output_input.set_value(str(self.default_output_path(self.info)) if self.info is not None else "")
         self.apply_source_defaults()
-        if self.info is not None and self.info.kind == "gif":
+        if self.info is not None:
             self.controls_panel.refresh()
+
+    def set_join_enabled(self, value: Any) -> None:
+        self.join_enabled = bool(value) and bool(self.join_paths)
+        if self.join_enabled:
+            self.compare_enabled = False
+        info = self.output_info()
+        if self.output_input:
+            self.output_input.set_value(str(self.default_output_path(info)) if info is not None else "")
+        self.apply_source_defaults()
+        self.preview_panel.refresh()
+        self.controls_panel.refresh()
 
     def mp4_output_active(self) -> bool:
         return self.target_output_kind() == "mp4"
@@ -1982,6 +2555,9 @@ class TrimTool:
             and self.compare_info is not None
             and self.compare_enabled
         )
+
+    def join_active(self) -> bool:
+        return bool(self.join_infos and self.join_enabled)
 
     def clear_compare(self) -> None:
         self.compare_info = None
@@ -2007,12 +2583,40 @@ class TrimTool:
         self.preview_panel.refresh()
         self.controls_panel.refresh()
 
+    def clear_join(self) -> None:
+        self.join_revision += 1
+        self.join_paths = []
+        self.join_infos = []
+        self.join_start_times = []
+        self.join_end_times = []
+        self.join_scrub_times = []
+        self.join_video_preview_paths = []
+        self.join_selected_index = 0
+        self.join_enabled = False
+        self.invalidate_rendered_join_output()
+        if self.join_paths_input:
+            self.join_paths_input.set_value("")
+        if self.output_input:
+            self.output_input.set_value(str(self.default_output_path(self.info)) if self.info is not None else "")
+        self.refresh_join_meta()
+        self.refresh_meta()
+        self.preview_panel.refresh()
+        self.controls_panel.refresh()
+
     def reset(self) -> None:
         self.stop_gif_playback()
         self.info = None
         self.compare_info = None
+        self.join_paths = []
+        self.join_infos = []
+        self.join_start_times = []
+        self.join_end_times = []
+        self.join_scrub_times = []
+        self.join_video_preview_paths = []
+        self.join_selected_index = 0
         self.compare_enabled = False
-        self.output_path = None
+        self.join_enabled = False
+        self.invalidate_rendered_join_output()
         self.output_format = "auto"
         self.start_time = 0.0
         self.end_time = 0.0
@@ -2041,6 +2645,8 @@ class TrimTool:
             self.path_input.set_value("")
         if self.compare_path_input:
             self.compare_path_input.set_value("")
+        if self.join_paths_input:
+            self.join_paths_input.set_value("")
         if self.output_input:
             self.output_input.set_value("")
         if self.save_copy_input:
@@ -2050,6 +2656,7 @@ class TrimTool:
         self.set_output_buttons(False)
         self.refresh_meta()
         self.refresh_compare_meta()
+        self.refresh_join_meta()
         self.preview_panel.refresh()
         self.controls_panel.refresh()
 
@@ -2062,6 +2669,8 @@ class TrimTool:
         return str(int(round(value)))
 
     def build_command(self, output_path: Path) -> list[str]:
+        if self.join_active():
+            return self.build_join_command(output_path)
         if self.info is None:
             raise ValueError("Load media before rendering.")
         if self.end_time <= self.start_time:
@@ -2069,6 +2678,7 @@ class TrimTool:
 
         selected_duration = self.end_time - self.start_time
         comparison_active = self.side_by_side_active()
+        joining_active = False
         target_kind = self.target_output_kind()
         mp4_output = target_kind == "mp4"
         backend = SCRIPT_DIR / ("videotool" if target_kind == "mp4" else "giftool")
@@ -2124,7 +2734,7 @@ class TrimTool:
 
             copy_mode = bool(self.copy_checkbox.value) if self.copy_checkbox and self.info.kind == "video" else False
             has_filters = any(flag in cmd for flag in ("-w", "-h", "-f"))
-            if copy_mode and not has_filters and not comparison_active and not caption:
+            if copy_mode and not has_filters and not comparison_active and not joining_active and not caption:
                 cmd.append("--copy")
             else:
                 crf = int(self.crf_slider.value) if self.crf_slider else 20
@@ -2133,16 +2743,114 @@ class TrimTool:
 
         return cmd
 
+    def build_join_command(self, output_path: Path) -> list[str]:
+        if not self.join_infos:
+            raise ValueError("Add clips before rendering a join.")
+        for index, info in enumerate(self.join_infos):
+            if self.join_end_times[index] <= self.join_start_times[index]:
+                raise ValueError(f"Clip {index + 1} end time must be greater than start time.")
+            if self.join_end_times[index] > info.duration + 0.01:
+                raise ValueError(f"Clip {index + 1} trim extends past the end of the media.")
+
+        first_info = self.join_infos[0]
+        cmd = [str(SCRIPT_DIR / "videotool"), "-i", str(first_info.path), "-o", str(output_path)]
+        if self.join_start_times[0] > 0:
+            cmd += ["-s", f"{self.join_start_times[0]:.3f}"]
+        cmd += ["-d", f"{self.join_end_times[0] - self.join_start_times[0]:.3f}"]
+
+        for index, info in enumerate(self.join_infos[1:], start=1):
+            cmd += ["--concat", str(info.path)]
+            if self.join_start_times[index] > 0:
+                cmd += ["--concat-start", f"{self.join_start_times[index]:.3f}"]
+            cmd += ["--concat-duration", f"{self.join_end_times[index] - self.join_start_times[index]:.3f}"]
+
+        width = self.output_dimension_value(self.width_input)
+        height = self.output_dimension_value(self.height_input)
+        fps = (self.fps_input.value or "").strip() if self.fps_input else ""
+        source_width = str(first_info.width or "")
+        source_height = str(first_info.height or "")
+        source_fps = f"{first_info.fps:.2f}".rstrip("0").rstrip(".") if first_info.fps else ""
+        if width and width != source_width:
+            cmd += ["-w", width]
+        if height and height != source_height:
+            cmd += ["-h", height]
+        if fps and fps != source_fps:
+            cmd += ["-f", fps]
+
+        caption = (self.caption_input.value or "").strip() if self.caption_input else ""
+        if caption:
+            position = self.text_position_select.value if self.text_position_select else "bottom"
+            size = int(self.text_size_input.value) if self.text_size_input and self.text_size_input.value else 36
+            cmd += ["--text", caption, "--text-position", str(position), "--text-size", str(size)]
+        crf = int(self.crf_slider.value) if self.crf_slider else 20
+        preset = self.preset_select.value if self.preset_select else "medium"
+        cmd += ["--crf", str(crf), "--preset", str(preset)]
+        return cmd
+
+    async def preview_join(self) -> None:
+        if self.previewing_join:
+            ui.notify("Join preview is already rendering.", type="warning")
+            return
+        if not self.join_paths or not self.join_enabled:
+            ui.notify("Add clips and enable Combine clips in order first.", type="warning")
+            return
+
+        PREVIEW_DIR.mkdir(parents=True, exist_ok=True)
+        token = secrets.token_hex(4)
+        preview_revision = self.join_revision
+        preview_output = PREVIEW_DIR / f"join-preview-{token}.mp4"
+        temporary_output = PREVIEW_DIR / f".join-preview-{token}.tmp.mp4"
+        try:
+            cmd = self.build_command(temporary_output)
+            cmd += ["-w", "640", "-h", "360", "-f", "24", "--crf", "32", "--preset", "ultrafast"]
+        except Exception as exc:
+            ui.notify(str(exc), type="negative")
+            return
+
+        self.previewing_join = True
+        if self.join_preview_button:
+            self.join_preview_button.disable()
+        self.set_status("Rendering join preview...")
+        try:
+            await asyncio.to_thread(subprocess.run, cmd, check=True, capture_output=True, text=True)
+            if not temporary_output.exists() or temporary_output.stat().st_size <= 0:
+                raise OSError("ffmpeg completed without producing a preview file.")
+            if preview_revision != self.join_revision:
+                temporary_output.unlink(missing_ok=True)
+                self.set_status("Join order changed; preview discarded.")
+                return
+            old_preview = self.join_preview_path
+            temporary_output.replace(preview_output)
+            self.join_preview_path = preview_output
+            if old_preview is not None:
+                old_preview.unlink(missing_ok=True)
+            self.preview_panel.refresh()
+            self.set_status("Join preview ready.")
+            ui.notify("Join preview ready.", type="positive")
+        except subprocess.CalledProcessError as exc:
+            temporary_output.unlink(missing_ok=True)
+            message = (exc.stderr or exc.stdout or "Join preview failed.").strip()
+            ui.notify(message[:500], type="negative")
+            self.set_status("Join preview failed.")
+        except Exception as exc:
+            temporary_output.unlink(missing_ok=True)
+            ui.notify(f"Could not create join preview: {exc}", type="negative")
+            self.set_status("Join preview failed.")
+        finally:
+            self.previewing_join = False
+            self.refresh_join_meta()
+
     async def render(self) -> None:
         if self.rendering:
             ui.notify("Render already in progress.", type="warning")
             return
-        if self.info is None:
-            ui.notify("Load a GIF or video first.", type="warning")
+        output_info = self.output_info()
+        if output_info is None:
+            ui.notify("Load clips first.", type="warning")
             return
 
         raw_output = (self.output_input.value or "").strip() if self.output_input else ""
-        output_path = Path(raw_output).expanduser() if raw_output else self.default_output_path(self.info)
+        output_path = Path(raw_output).expanduser() if raw_output else self.default_output_path(output_info)
         target_kind = self.target_output_kind()
         if not output_path.suffix:
             output_path = output_path.with_suffix(".mp4" if target_kind == "mp4" else ".gif")
@@ -2151,15 +2859,31 @@ class TrimTool:
         elif target_kind == "gif" and output_path.suffix.lower() != ".gif":
             output_path = output_path.with_suffix(".gif")
 
+        source_paths = list(self.join_paths) if self.join_active() else [output_info.path]
+        if self.side_by_side_active() and self.compare_info is not None:
+            source_paths.append(self.compare_info.path)
+        try:
+            resolved_output = output_path.resolve()
+            if any(resolved_output == source_path.resolve() for source_path in source_paths):
+                raise ValueError("Output path must be different from every input clip.")
+        except OSError as exc:
+            ui.notify(f"Could not validate output path: {exc}", type="negative")
+            return
+
+        temporary_output = output_path.with_name(
+            f".{output_path.name}.{secrets.token_hex(4)}.tmp{output_path.suffix}"
+        )
         try:
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            cmd = self.build_command(output_path)
+            cmd = self.build_command(temporary_output)
         except Exception as exc:
             ui.notify(str(exc), type="negative")
             return
 
         if self.command_label:
-            self.command_label.set_text(shell_join(cmd))
+            display_cmd = [*cmd]
+            display_cmd[display_cmd.index("-o") + 1] = str(output_path)
+            self.command_label.set_text(shell_join(display_cmd))
         if self.status:
             self.status.set_text("Rendering...")
         self.rendering = True
@@ -2169,15 +2893,39 @@ class TrimTool:
         try:
             await asyncio.to_thread(subprocess.run, cmd, check=True, capture_output=True, text=True)
         except subprocess.CalledProcessError as exc:
+            temporary_output.unlink(missing_ok=True)
             message = (exc.stderr or exc.stdout or "Render failed.").strip()
             ui.notify(message[:500], type="negative")
             if self.status:
                 self.status.set_text("Render failed.")
             return
+        except OSError as exc:
+            temporary_output.unlink(missing_ok=True)
+            ui.notify(f"Could not start render: {exc}", type="negative")
+            if self.status:
+                self.status.set_text("Render could not start.")
+            return
+        except Exception as exc:
+            temporary_output.unlink(missing_ok=True)
+            ui.notify(f"Render failed unexpectedly: {exc}", type="negative")
+            if self.status:
+                self.status.set_text("Render failed unexpectedly.")
+            return
         finally:
             self.rendering = False
             if self.render_button:
                 self.render_button.enable()
+
+        try:
+            if not temporary_output.exists() or temporary_output.stat().st_size <= 0:
+                raise OSError("ffmpeg completed without producing an output file.")
+            temporary_output.replace(output_path)
+        except OSError as exc:
+            temporary_output.unlink(missing_ok=True)
+            ui.notify(f"Could not finalize rendered output: {exc}", type="negative")
+            if self.status:
+                self.status.set_text("Render finalization failed.")
+            return
 
         self.output_path = output_path
         if self.output_input:
@@ -2238,8 +2986,9 @@ class TrimTool:
 
     def choose_save_copy_path(self) -> None:
         initial_path = self.output_path
-        if initial_path is None and self.info is not None:
-            initial_path = self.default_output_path(self.info)
+        info = self.output_info()
+        if initial_path is None and info is not None:
+            initial_path = self.default_output_path(info)
         if initial_path is None:
             ui.notify("Load or render media before choosing a save path.", type="warning")
             return

@@ -30,6 +30,9 @@ The current app supports:
 - width, height, scale, and FPS controls.
 - subtitle-style MP4 text overlays.
 - side-by-side comparison renders with independent trim ranges and panel labels.
+- multi-clip joining that works as a complete source without first loading a separate single clip.
+- independent start/end trims for every joined clip, with one active clip preview to keep memory use bounded.
+- combined join preview playback, reordering, removal, and optional text overlays on the finished sequence.
 - local browser mode, native window mode, and CLI-only usage.
 
 ## Quick Start
@@ -168,6 +171,23 @@ videotool \
 ```
 
 In comparison mode, `--start` and `--duration` trim the left input, while `--compare-start` and `--compare-duration` trim the right input. The side-by-side render automatically uses the shorter selected range so both panels end together.
+
+Join multiple clips into one MP4, optionally adding a caption after the clips are stitched:
+
+```bash
+videotool \
+  -i intro.mp4 \
+  -s 0.5 -d 3.0 \
+  --concat middle.mp4 --concat-start 1.0 --concat-duration 4.0 \
+  --concat outro.mp4 --concat-duration 2.5 \
+  -o joined.mp4 \
+  --text "Experiment 17" \
+  --text-position bottom
+```
+
+In the app, add all files under **Combine Clips**, choose a clip in the Preview panel to set its start and end handles, then use the arrow controls to change the sequence. **Preview Join** renders the same order, trims, sizing, and caption settings used by the final output.
+
+Join mode normalizes clip dimensions and frame rates for clean cuts between inputs. It preserves audio when every input has an audio stream; if any input is silent, the joined output is rendered without audio.
 
 ## Repository Layout
 
